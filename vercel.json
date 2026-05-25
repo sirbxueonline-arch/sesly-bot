@@ -4,15 +4,10 @@
     {
       "src": "api/index.py",
       "use": "@vercel/python",
-      "config": { "includeFiles": "**" }
+      "config": { "includeFiles": "**", "maxLambdaSize": "50mb" }
     }
   ],
   "routes": [
     { "src": "/(.*)", "dest": "/api/index.py" }
-  ],
-  "functions": {
-    "api/index.py": {
-      "maxDuration": 60
-    }
-  }
+  ]
 }
