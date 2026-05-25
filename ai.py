@@ -11,7 +11,7 @@ from anthropic import Anthropic
 _client: Optional[Anthropic] = None
 
 MODEL = "claude-haiku-4-5"
-MAX_TOKENS = 350
+MAX_TOKENS = 600
 
 
 def client() -> Anthropic:
@@ -26,11 +26,19 @@ def client() -> Anthropic:
 
 def build_system_prompt(bot: dict) -> str:
     """Build a system prompt tailored to a specific bot's business."""
+    from datetime import datetime, timezone, timedelta
     biz = bot.get("businesses") or {}
     biz_type = biz.get("type", "biznes")
 
+    # Today's date in Baku (UTC+4) so the AI computes "sabah" / "cümə" correctly.
+    now = datetime.now(timezone(timedelta(hours=4)))
+    weekday_az = ["Bazar ertəsi", "Çərşənbə axşamı", "Çərşənbə", "Cümə axşamı",
+                  "Cümə", "Şənbə", "Bazar"][now.weekday()]
+    today_str = now.strftime("%Y-%m-%d")
+
     base = (
-        f"Sən {bot['display_name']} biznesinin WhatsApp AI köməkçisisən.\n\n"
+        f"Sən {bot['display_name']} biznesinin WhatsApp AI köməkçisisən.\n"
+        f"Bu gün: {today_str} ({weekday_az}) — Bakı vaxtı.\n\n"
         "════════ DİL — ƏN VACİBİ QAYDA ════════\n"
         "Sən YALNIZ AZƏRBAYCAN DİLİNDƏ danışırsan. Heç vaxt Türkiyə türkcəsində YAZMA.\n"
         "Azərbaycanca və Türkcə oxşar görünsə də, FƏRQLİDİR. Aşağıdakı təcrübə cədvəlini ciddi izlə:\n\n"
@@ -115,20 +123,34 @@ def build_system_prompt(bot: dict) -> str:
         "• Randevu istəyəndə dəqiq tarix və saat təklif et, sonra təsdiqlət.\n"
         "• Qiymət sualına HƏMİŞƏ konkret rəqəm ver (xidmətlər siyahısından).\n"
         "• Bilmədiyini söyləməkdə utanma — uydurma.\n\n"
-        "════════ RANDEVU TƏSDİQLƏNDİRMƏ ════════\n"
-        "Müştəri ilə BU MESAJDA randevu, görüş, sifariş və ya rezervasyon RƏSMİ TƏSDİQLƏNƏRSƏ "
-        "(yəni müştəri \"bəli\", \"təsdiq\", \"oldu\" və ya bənzər söz işlədib və ya açıq şəkildə "
-        "konkret vaxta razılıq verib) — cavabının ƏN SONUNA aşağıdakı formatda gizli sətr əlavə et:\n\n"
+        "════════ RANDEVU/SİFARİŞ ÇIXARMA ════════\n"
+        "Müştəri xüsusi tarix/saat və ya xidmət barədə danışırsa, cavabının ƏN SONUNA\n"
+        "(adi mətndən sonra ayrı sətrdə) bu gizli sətri əlavə et:\n\n"
         "[BOOKING]{\"service\":\"...\",\"date\":\"YYYY-MM-DD\",\"time\":\"HH:MM\",\"duration_minutes\":60,\"price_azn\":15,\"customer_name\":\"...\",\"status\":\"confirmed\",\"notes\":\"...\"}[/BOOKING]\n\n"
-        "Qaydalar:\n"
-        "• `date` — bugünkü tarixə nisbətən təxmin et (məsələn \"sabah\" = sabahın tarixi).\n"
-        "• `time` — 24 saatlıq format (\"14:00\", \"09:30\").\n"
-        "• `price_azn` — xidmət siyahısından konkret rəqəm (yoxdursa null).\n"
+        "STATUS QAYDASI:\n"
+        "• `confirmed` — siz \"Təsdiqləndi\" / \"Yazdım\" / \"Sizi yazdım\" və müştəri razı oldu.\n"
+        "• `pending` — müştəri vaxt soruşur və ya təklif edir, hələ yekun razılıq yoxdur.\n"
+        "Yəni: müştəri \"sabah 14:00-a olar?\" desə → pending. \"Bəli zəhmət olmasa\" desə → confirmed.\n\n"
+        "SAHƏLƏR:\n"
+        "• `date` — bu günə nisbətən hesabla (\"sabah\" = sabahın tarixi, \"cümə\" = növbəti cümə).\n"
+        "• `time` — 24 saatlıq (\"14:00\", \"09:30\"). Müştəri \"3-də\" desə → 15:00 təxmin et.\n"
+        "• `service` — xidmət siyahısından dəqiq ad.\n"
+        "• `price_azn` — xidmət siyahısından rəqəm (bilinmirsə null).\n"
         "• `customer_name` — yalnız müştəri öz adını deyibsə (əks halda null).\n"
-        "• `notes` — istifadəçinin əlavə qeydləri (məs. \"saç kəsimi və boyanma birlikdə\").\n"
-        "• Hələ TƏSDİQLƏNMƏYİBSƏ (yəni vaxt müzakirə olunur) — `status: \"pending\"` yaz.\n"
-        "• Yalnız RANDEVU/SİFARİŞ ola bilərsə bu tag-i əlavə et. Sadə sual-cavab üçün YAZMA.\n"
-        "• Bu tag istifadəçiyə görünməyəcək — sistem onu silir.\n"
+        "• `notes` — qısa qeyd (məs. \"+ saç boyanması da\") və ya null.\n\n"
+        "NÜMUNƏLƏR:\n\n"
+        "Müştəri: \"Sabah saat 14:00-a manikür ola bilərmi?\"\n"
+        "Cavabın:\n"
+        "Salam! Sabah saat 14:00 boşdur 🌸 Adınızı bilə bilərəm?\n"
+        "[BOOKING]{\"service\":\"Manikür\",\"date\":\"2026-05-27\",\"time\":\"14:00\",\"price_azn\":12,\"status\":\"pending\"}[/BOOKING]\n\n"
+        "Müştəri (növbəti turdə): \"Mən Ayşə, təsdiqləyirəm\"\n"
+        "Cavabın:\n"
+        "Çox gözəl Ayşə xanım! ✅ Sabah saat 14:00-a manikür üçün sizi yazdım.\n"
+        "[BOOKING]{\"service\":\"Manikür\",\"date\":\"2026-05-27\",\"time\":\"14:00\",\"price_azn\":12,\"customer_name\":\"Ayşə\",\"status\":\"confirmed\"}[/BOOKING]\n\n"
+        "Müştəri: \"İş saatlarınız necədir?\" (vaxt yox, sadəcə məlumat soruşur)\n"
+        "Cavabın: (BOOKING tag-ı YOX, sadəcə cavab)\n"
+        "İş saatlarımız: B.ertəsi–Cümə 09:00-19:00.\n\n"
+        "MÜHÜM: Tag istifadəçiyə görünməyəcək — sistem onu silir. Hər randevu söhbətində yaz.\n"
     )
 
     extra = (bot.get("system_prompt_addition") or "").strip()
@@ -206,7 +228,12 @@ def generate_reply_with_booking(
                 chunks.append(block.text)
         text = "".join(chunks).strip()
         if text:
+            print(f"[ai] raw reply ({len(text)} chars): {text[:400]!r}")
             cleaned, booking = extract_booking(text)
+            if booking:
+                print(f"[ai] extracted booking: {booking}")
+            else:
+                print("[ai] no booking tag found in reply")
             return cleaned, booking
     except Exception as e:
         print(f"[ai] generation failed: {e}")
