@@ -69,6 +69,13 @@ def _send_text(phone_number_id: str, to: str, body: str) -> None:
         print(f"[send] error: {e}")
 
 
+LIMIT_REACHED_MESSAGE = (
+    "Üzr istəyirik 🙏 Bu ay üçün biznesin mesaj limiti dolub.\n"
+    "Müştəri sizinlə birbaşa əlaqə saxlamalıdır.\n\n"
+    "(Biznes sahibinə: planı yeniləyin — seslyai.com)"
+)
+
+
 def _handle_message(customer_phone: str, message: str, message_type: str = "text") -> str:
     """Core routing logic. Returns the reply text."""
     handle = parse_handle(message)
@@ -85,6 +92,9 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
 
         extra = get_remaining_message(message)
         if extra:
+            # Plan limit check (before saving anything, so we don't bloat counts)
+            if db.is_over_message_limit(bot):
+                return LIMIT_REACHED_MESSAGE
             db.save_message(bot["id"], customer_phone, "user", extra, message_type)
             history = db.get_recent_history(bot["id"], customer_phone)
             if history and history[-1].get("content") == extra:
@@ -102,6 +112,10 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
     bot = db.get_active_bot(customer_phone)
     if not bot:
         return NO_BOT_MESSAGE
+
+    # Plan limit check
+    if db.is_over_message_limit(bot):
+        return LIMIT_REACHED_MESSAGE
 
     db.save_message(bot["id"], customer_phone, "user", message, message_type)
     history = db.get_recent_history(bot["id"], customer_phone)

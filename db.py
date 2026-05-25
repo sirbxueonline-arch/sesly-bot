@@ -34,7 +34,7 @@ def get_bot_by_handle(handle: str) -> Optional[dict]:
         result = (
             client()
             .table("bots")
-            .select("*, businesses(name, type)")
+            .select("*, businesses(name, type, plan)")
             .eq("handle", h)
             .eq("is_active", True)
             .maybe_single()
@@ -46,7 +46,6 @@ def get_bot_by_handle(handle: str) -> Optional[dict]:
         print(f"[db] get_bot_by_handle (active+join) failed: {e}")
 
     # Step 2: fallback — just by handle, no join, no is_active filter
-    # (helps us see whether the bot exists at all)
     try:
         result = (
             client()
@@ -61,7 +60,6 @@ def get_bot_by_handle(handle: str) -> Optional[dict]:
                 f"[db] bot {h!r} exists but failed primary lookup; "
                 f"is_active={result.data.get('is_active')}"
             )
-            # Only return if active
             if result.data.get("is_active"):
                 return result.data
     except Exception as e:
@@ -69,6 +67,78 @@ def get_bot_by_handle(handle: str) -> Optional[dict]:
 
     print(f"[db] no active bot found for handle={h!r}")
     return None
+
+
+# Plan limits — mirrors lib/plans.ts in the dashboard
+PLAN_LIMITS = {
+    "free":  {"messages": 100,  "bots": 1, "name": "Sınaq"},
+    "start": {"messages": 1000, "bots": 3, "name": "Başlanğıc"},
+    "pro":   {"messages": None, "bots": 3, "name": "Pro"},
+}
+
+
+def get_monthly_user_message_count(business_id: str) -> int:
+    """Count customer (user-role) messages in the current calendar month."""
+    if not business_id:
+        return 0
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+        bots = (
+            client()
+            .table("bots")
+            .select("id")
+            .eq("business_id", business_id)
+            .execute()
+        )
+        bot_ids = [b["id"] for b in (bots.data or [])]
+        if not bot_ids:
+            return 0
+
+        convs = (
+            client()
+            .table("conversations")
+            .select("id")
+            .in_("bot_id", bot_ids)
+            .execute()
+        )
+        conv_ids = [c["id"] for c in (convs.data or [])]
+        if not conv_ids:
+            return 0
+
+        result = (
+            client()
+            .table("messages")
+            .select("id", count="exact")
+            .in_("conversation_id", conv_ids)
+            .eq("role", "user")
+            .gte("created_at", month_start)
+            .execute()
+        )
+        return result.count or 0
+    except Exception as e:
+        print(f"[db] message count failed: {e}")
+        return 0
+
+
+def is_over_message_limit(bot: dict) -> bool:
+    """Returns True if the bot's business has hit its monthly message cap."""
+    biz = bot.get("businesses") or {}
+    plan = (biz.get("plan") or "free").lower()
+    cap = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])["messages"]
+    if cap is None:
+        return False
+    used = get_monthly_user_message_count(bot.get("business_id"))
+    print(f"[plan] {plan}: {used}/{cap} messages this month")
+    return used >= cap
+
+
+def get_plan_name(bot: dict) -> str:
+    biz = bot.get("businesses") or {}
+    plan = (biz.get("plan") or "free").lower()
+    return PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])["name"]
 
 
 def get_active_bot(customer_phone: str) -> Optional[dict]:
