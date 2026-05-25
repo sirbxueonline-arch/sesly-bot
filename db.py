@@ -73,7 +73,7 @@ def get_bot_by_handle(handle: str) -> Optional[dict]:
 PLAN_LIMITS = {
     "free":  {"messages": 100,  "bots": 1, "name": "Sınaq"},
     "start": {"messages": 1000, "bots": 3, "name": "Başlanğıc"},
-    "pro":   {"messages": None, "bots": 3, "name": "Pro"},
+    "pro":   {"messages": None, "bots": 5, "name": "Pro"},
 }
 
 
