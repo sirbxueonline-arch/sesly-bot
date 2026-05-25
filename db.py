@@ -288,11 +288,58 @@ def save_booking(
     # Strip Nones — Postgres prefers omitted over null for some columns
     payload = {k: v for k, v in payload.items() if v is not None}
 
+    # Dedup: if we already created a booking for the SAME (bot, phone) in the
+    # last 2 hours, update it instead of inserting a new one. This handles the
+    # "pending → confirmed" flow where the AI emits two booking tags across
+    # consecutive turns for the same appointment.
+    try:
+        from datetime import datetime, timezone, timedelta
+        two_hours_ago = (
+            datetime.now(timezone.utc) - timedelta(hours=2)
+        ).isoformat()
+        existing = (
+            client()
+            .table("bookings")
+            .select("id, scheduled_at, status")
+            .eq("bot_id", bot_id)
+            .eq("customer_phone", customer_phone)
+            .gte("created_at", two_hours_ago)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            old = existing.data[0]
+            old_at = old.get("scheduled_at")
+            new_at = payload.get("scheduled_at")
+
+            # Match if:
+            #  • same time slot, OR
+            #  • either side has no scheduled_at (treat as same conversation),
+            #    OR the new booking is just upgrading status
+            same_slot = (old_at == new_at) or (old_at and new_at and old_at == new_at)
+            either_missing = old_at is None or new_at is None
+            status_upgrade = (
+                old.get("status") == "pending"
+                and payload.get("status") == "confirmed"
+            )
+            if same_slot or either_missing or status_upgrade:
+                update_payload = {k: v for k, v in payload.items() if k not in ("conversation_id",)}
+                client().table("bookings").update(update_payload).eq("id", old["id"]).execute()
+                print(
+                    f"[booking] updated existing {old['id'][:8]}… "
+                    f"({old.get('status')} → {payload.get('status')})"
+                )
+                return
+    except Exception as e:
+        print(f"[booking] dedup check failed: {e}")
+
+    # No match — insert new
     try:
         client().table("bookings").insert(payload).execute()
-        print(f"[booking] saved: {payload.get('service')} @ {payload.get('scheduled_at')}")
+        print(f"[booking] inserted: {payload.get('service')} @ {payload.get('scheduled_at')}")
     except Exception as e:
-        print(f"[booking] save failed: {e}")
+        print(f"[booking] insert failed: {e}")
 
 
 def get_recent_history(
