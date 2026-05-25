@@ -124,6 +124,33 @@ def health():
     return {"status": "ok"}
 
 
+@app.route("/debug", methods=["GET"])
+def debug():
+    """Diagnostic endpoint — confirms env + DB connectivity."""
+    out = {
+        "env": {
+            "SUPABASE_URL": bool(os.getenv("SUPABASE_URL")),
+            "SUPABASE_SERVICE_ROLE_KEY_set": bool(os.getenv("SUPABASE_SERVICE_ROLE_KEY")),
+            "SUPABASE_SERVICE_ROLE_KEY_starts": (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "")[:6],
+            "META_ACCESS_TOKEN_set": bool(os.getenv("META_ACCESS_TOKEN")),
+            "META_VERIFY_TOKEN_set": bool(os.getenv("META_VERIFY_TOKEN")),
+            "ANTHROPIC_API_KEY_set": bool(os.getenv("ANTHROPIC_API_KEY")),
+            "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
+        }
+    }
+    # Probe DB
+    try:
+        bots = db.client().table("bots").select("handle, is_active, display_name").execute()
+        out["bots_count"] = len(bots.data or [])
+        out["handles"] = [
+            {"handle": b.get("handle"), "is_active": b.get("is_active"), "name": b.get("display_name")}
+            for b in (bots.data or [])
+        ][:20]
+    except Exception as e:
+        out["db_error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 @app.route("/whatsapp", methods=["GET"])
 def whatsapp_verify():
     """
