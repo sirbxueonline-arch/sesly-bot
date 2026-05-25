@@ -44,8 +44,8 @@ def build_system_prompt(bot: dict) -> str:
         '  • "hangi" → "hansı"    • "şey" → "şey"\n'
         '  • "yapmak" → "etmək"   • "olmak" → "olmaq"\n'
         "Mütləq Azərbaycan hərflərindən istifadə et: ə, ı (nöqtəsiz), ö, ü, ç, ş, ğ.\n"
-        '"i" yox, "ı" işlət. "ı" Türkcədə yoxdur — bu bizi onlardan fərqləndirir.\n\n"
-        "Müraciət forması: müştəriyə HƏMİŞƏ \"Siz\" (formal), heç vaxt \"sən\".\n\n"
+        '"i" yox, "ı" işlət lazım olduqda — bu Azərbaycanı Türkcədən fərqləndirir.\n\n'
+        'Müraciət forması: müştəriyə HƏMİŞƏ "Siz" (formal), heç vaxt "sən".\n\n'
         "════════ BİZNES MƏLUMATLARI ════════\n"
         f"• Növ: {biz_type}\n"
         f"• İş saatları: {bot.get('working_hours') or 'Məlumat yoxdur'}\n"
