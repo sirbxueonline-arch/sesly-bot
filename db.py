@@ -28,19 +28,47 @@ def client() -> Client:
 
 def get_bot_by_handle(handle: str) -> Optional[dict]:
     """Look up bot config by handle (e.g. 'alcipan')."""
+    h = (handle or "").lower().strip()
+    # Step 1: try the canonical lookup (handle + active)
     try:
         result = (
             client()
             .table("bots")
             .select("*, businesses(name, type)")
-            .eq("handle", handle.lower())
+            .eq("handle", h)
             .eq("is_active", True)
-            .single()
+            .maybe_single()
             .execute()
         )
-        return result.data
-    except Exception:
-        return None
+        if result and result.data:
+            return result.data
+    except Exception as e:
+        print(f"[db] get_bot_by_handle (active+join) failed: {e}")
+
+    # Step 2: fallback — just by handle, no join, no is_active filter
+    # (helps us see whether the bot exists at all)
+    try:
+        result = (
+            client()
+            .table("bots")
+            .select("*")
+            .eq("handle", h)
+            .maybe_single()
+            .execute()
+        )
+        if result and result.data:
+            print(
+                f"[db] bot {h!r} exists but failed primary lookup; "
+                f"is_active={result.data.get('is_active')}"
+            )
+            # Only return if active
+            if result.data.get("is_active"):
+                return result.data
+    except Exception as e:
+        print(f"[db] get_bot_by_handle (fallback) failed: {e}")
+
+    print(f"[db] no active bot found for handle={h!r}")
+    return None
 
 
 def get_active_bot(customer_phone: str) -> Optional[dict]:
