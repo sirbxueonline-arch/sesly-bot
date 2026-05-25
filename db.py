@@ -330,16 +330,80 @@ def save_booking(
                     f"[booking] updated existing {old['id'][:8]}… "
                     f"({old.get('status')} → {payload.get('status')})"
                 )
+                # Notify the owner only on transitions INTO confirmed
+                if status_upgrade and payload.get("status") == "confirmed":
+                    _notify_owner_of_booking(bot_id, customer_phone, payload)
                 return
     except Exception as e:
         print(f"[booking] dedup check failed: {e}")
 
     # No match — insert new
+    inserted = False
     try:
         client().table("bookings").insert(payload).execute()
+        inserted = True
         print(f"[booking] inserted: {payload.get('service')} @ {payload.get('scheduled_at')}")
     except Exception as e:
         print(f"[booking] insert failed: {e}")
+
+    if inserted and status == "confirmed":
+        _notify_owner_of_booking(bot_id, customer_phone, payload)
+
+
+def _notify_owner_of_booking(bot_id: str, customer_phone: str, payload: dict) -> None:
+    """Send a WhatsApp ping to the business owner that a booking landed."""
+    try:
+        from notify import send_to_owner
+        bot_row = (
+            client()
+            .table("bots")
+            .select("display_name, businesses(phone, name)")
+            .eq("id", bot_id)
+            .maybe_single()
+            .execute()
+        )
+        if not bot_row or not bot_row.data:
+            return
+        biz = bot_row.data.get("businesses") or {}
+        owner_phone = (biz.get("phone") or "").strip()
+        if not owner_phone:
+            print("[notify] business has no owner phone configured — skipping")
+            return
+
+        biz_name = biz.get("name") or bot_row.data.get("display_name") or "Botunuz"
+        service = payload.get("service") or "Sifariş"
+        when = payload.get("scheduled_at")
+        when_display = payload.get("scheduled_time_text")
+        if when and not when_display:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(when.replace("Z", "+00:00"))
+                when_display = dt.strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                when_display = when
+
+        lines = ["🔔 Yeni randevu", ""]
+        if payload.get("customer_name"):
+            lines.append(f"👤 {payload['customer_name']} · {customer_phone}")
+        else:
+            lines.append(f"👤 {customer_phone}")
+        lines.append(f"🛠  {service}")
+        if when_display:
+            lines.append(f"📅 {when_display}")
+        if payload.get("duration_minutes"):
+            lines.append(f"⏱  {payload['duration_minutes']} dəq")
+        if payload.get("price_azn") is not None:
+            lines.append(f"💰 {payload['price_azn']} AZN")
+        if payload.get("notes"):
+            lines.append(f"📝 {payload['notes']}")
+        lines.append("")
+        lines.append(f"({biz_name})")
+
+        ok = send_to_owner(owner_phone, "\n".join(lines))
+        if ok:
+            print(f"[notify] owner alerted at {owner_phone}")
+    except Exception as e:
+        print(f"[notify] failed: {e}")
 
 
 def get_recent_history(
