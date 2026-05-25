@@ -176,6 +176,55 @@ def save_message(
         pass
 
 
+def save_booking(
+    bot_id: str,
+    customer_phone: str,
+    booking: dict,
+) -> None:
+    """Persist a booking record extracted from the AI reply."""
+    if not booking or not isinstance(booking, dict):
+        return
+
+    date = (booking.get("date") or "").strip() or None
+    time = (booking.get("time") or "").strip() or None
+    scheduled_at = None
+    scheduled_time_text = booking.get("time_text") or None
+
+    if date and time and len(date) == 10 and len(time) >= 4:
+        # Combine into UTC-naive ISO. Postgres will treat as timestamptz (UTC).
+        scheduled_at = f"{date}T{time}:00"
+        scheduled_time_text = scheduled_time_text or f"{date} {time}"
+
+    status = (booking.get("status") or "confirmed").strip().lower()
+    if status not in ("pending", "confirmed", "cancelled", "completed", "no_show"):
+        status = "confirmed"
+
+    conv_id = _get_or_create_conversation(bot_id, customer_phone)
+
+    payload = {
+        "bot_id": bot_id,
+        "conversation_id": conv_id,
+        "customer_phone": customer_phone,
+        "customer_name": booking.get("customer_name"),
+        "service": booking.get("service"),
+        "scheduled_at": scheduled_at,
+        "scheduled_time_text": scheduled_time_text,
+        "duration_minutes": booking.get("duration_minutes"),
+        "price_azn": booking.get("price_azn"),
+        "status": status,
+        "notes": booking.get("notes"),
+        "raw_payload": booking,
+    }
+    # Strip Nones — Postgres prefers omitted over null for some columns
+    payload = {k: v for k, v in payload.items() if v is not None}
+
+    try:
+        client().table("bookings").insert(payload).execute()
+        print(f"[booking] saved: {payload.get('service')} @ {payload.get('scheduled_at')}")
+    except Exception as e:
+        print(f"[booking] save failed: {e}")
+
+
 def get_recent_history(
     bot_id: str, customer_phone: str, limit: int = 10
 ) -> list[dict]:

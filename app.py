@@ -89,8 +89,10 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
             history = db.get_recent_history(bot["id"], customer_phone)
             if history and history[-1].get("content") == extra:
                 history = history[:-1]
-            reply = ai.generate_reply(bot, extra, history)
+            reply, booking = ai.generate_reply_with_booking(bot, extra, history)
             db.save_message(bot["id"], customer_phone, "assistant", reply)
+            if booking:
+                db.save_booking(bot["id"], customer_phone, booking)
             return reply
 
         greeting = bot.get("greeting_message") or "Salam! 👋"
@@ -105,8 +107,10 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
     history = db.get_recent_history(bot["id"], customer_phone)
     if history and history[-1].get("content") == message:
         history = history[:-1]
-    reply = ai.generate_reply(bot, message, history)
+    reply, booking = ai.generate_reply_with_booking(bot, message, history)
     db.save_message(bot["id"], customer_phone, "assistant", reply)
+    if booking:
+        db.save_booking(bot["id"], customer_phone, booking)
     return reply
 
 

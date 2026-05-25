@@ -3,7 +3,9 @@ Claude (Anthropic) reply generation, with per-bot system prompts.
 """
 from __future__ import annotations
 import os
-from typing import Optional
+import re
+import json
+from typing import Optional, Tuple
 from anthropic import Anthropic
 
 _client: Optional[Anthropic] = None
@@ -58,7 +60,21 @@ def build_system_prompt(bot: dict) -> str:
         "• Müştəri əsəbi olsa, sakit qal: \"Anlayıram, üzr istəyirik.\" — sonra problemə qayıt.\n"
         "• Randevu istəyəndə dəqiq tarix və saat təklif et, sonra təsdiqlət.\n"
         "• Qiymət sualına HƏMİŞƏ konkret rəqəm ver (xidmətlər siyahısından).\n"
-        "• Bilmədiyini söyləməkdə utanma — uydurma.\n"
+        "• Bilmədiyini söyləməkdə utanma — uydurma.\n\n"
+        "════════ RANDEVU TƏSDİQLƏNDİRMƏ ════════\n"
+        "Müştəri ilə BU MESAJDA randevu, görüş, sifariş və ya rezervasyon RƏSMİ TƏSDİQLƏNƏRSƏ "
+        "(yəni müştəri \"bəli\", \"təsdiq\", \"oldu\" və ya bənzər söz işlədib və ya açıq şəkildə "
+        "konkret vaxta razılıq verib) — cavabının ƏN SONUNA aşağıdakı formatda gizli sətr əlavə et:\n\n"
+        "[BOOKING]{\"service\":\"...\",\"date\":\"YYYY-MM-DD\",\"time\":\"HH:MM\",\"duration_minutes\":60,\"price_azn\":15,\"customer_name\":\"...\",\"status\":\"confirmed\",\"notes\":\"...\"}[/BOOKING]\n\n"
+        "Qaydalar:\n"
+        "• `date` — bugünkü tarixə nisbətən təxmin et (məsələn \"sabah\" = sabahın tarixi).\n"
+        "• `time` — 24 saatlıq format (\"14:00\", \"09:30\").\n"
+        "• `price_azn` — xidmət siyahısından konkret rəqəm (yoxdursa null).\n"
+        "• `customer_name` — yalnız müştəri öz adını deyibsə (əks halda null).\n"
+        "• `notes` — istifadəçinin əlavə qeydləri (məs. \"saç kəsimi və boyanma birlikdə\").\n"
+        "• Hələ TƏSDİQLƏNMƏYİBSƏ (yəni vaxt müzakirə olunur) — `status: \"pending\"` yaz.\n"
+        "• Yalnız RANDEVU/SİFARİŞ ola bilərsə bu tag-i əlavə et. Sadə sual-cavab üçün YAZMA.\n"
+        "• Bu tag istifadəçiyə görünməyəcək — sistem onu silir.\n"
     )
 
     extra = (bot.get("system_prompt_addition") or "").strip()
@@ -68,14 +84,53 @@ def build_system_prompt(bot: dict) -> str:
     return base
 
 
+_BOOKING_RE = re.compile(
+    r"\[BOOKING\]\s*(\{.*?\})\s*\[/BOOKING\]",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def extract_booking(text: str) -> Tuple[str, Optional[dict]]:
+    """
+    Pull a [BOOKING]{...}[/BOOKING] payload out of the AI reply.
+    Returns (cleaned_text, booking_dict_or_None).
+    """
+    if not text:
+        return text, None
+    m = _BOOKING_RE.search(text)
+    if not m:
+        return text, None
+    raw = m.group(1)
+    cleaned = _BOOKING_RE.sub("", text).strip()
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return cleaned, None
+        return cleaned, data
+    except Exception as e:
+        print(f"[ai] booking JSON parse failed: {e}; raw={raw!r}")
+        return cleaned, None
+
+
 def generate_reply(bot: dict, user_message: str, history: list[dict]) -> str:
     """
-    Generate an AI reply for the given bot using prior conversation history.
+    Backwards-compatible wrapper — returns only the user-facing text.
+    """
+    reply, _booking = generate_reply_with_booking(bot, user_message, history)
+    return reply
+
+
+def generate_reply_with_booking(
+    bot: dict, user_message: str, history: list[dict]
+) -> Tuple[str, Optional[dict]]:
+    """
+    Generate an AI reply and extract any structured booking payload.
+
     history: list of {"role": "user"|"assistant", "content": str}
+    Returns: (user_facing_reply, booking_dict_or_None)
     """
     system = build_system_prompt(bot)
 
-    # Build messages: history + current user message
     messages: list[dict] = []
     for m in history:
         role = m.get("role")
@@ -91,18 +146,18 @@ def generate_reply(bot: dict, user_message: str, history: list[dict]) -> str:
             system=system,
             messages=messages,
         )
-        # Concatenate text blocks
         chunks = []
         for block in resp.content:
             if getattr(block, "type", None) == "text":
                 chunks.append(block.text)
         text = "".join(chunks).strip()
         if text:
-            return text
+            cleaned, booking = extract_booking(text)
+            return cleaned, booking
     except Exception as e:
         print(f"[ai] generation failed: {e}")
 
     return (
         "Üzr istəyirəm, hal-hazırda cavab verə bilmirəm. "
         "Bir az sonra yenidən cəhd edin."
-    )
+    ), None
