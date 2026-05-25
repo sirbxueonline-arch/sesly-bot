@@ -1,17 +1,18 @@
 """
-Sesly — multi-tenant WhatsApp webhook server.
+Sesly — multi-tenant WhatsApp webhook server (Meta Cloud API).
 
-Twilio POSTs incoming WhatsApp messages here. We:
-1. Strip the `whatsapp:` prefix from the From number.
-2. Parse a `/handle` if present.
-3. Route to the right bot (or send onboarding / "not found").
-4. Save the inbound + outbound messages.
-5. Reply via TwiML.
+Meta sends:
+- GET  /whatsapp — verification handshake (challenge / verify_token)
+- POST /whatsapp — incoming messages as JSON
+
+We reply by calling Graph API:
+- POST https://graph.facebook.com/v20.0/<phone-number-id>/messages
 """
 from __future__ import annotations
 import os
-from flask import Flask, request, Response
-from twilio.twiml.messaging_response import MessagingResponse
+import json
+import requests
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
 import db
@@ -30,66 +31,76 @@ load_dotenv()
 
 app = Flask(__name__)
 
+GRAPH_API_VERSION = os.getenv("META_GRAPH_VERSION", "v20.0")
+GRAPH_API = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Send / verify helpers
 # ---------------------------------------------------------------------------
 
-def _twiml(text: str) -> Response:
-    resp = MessagingResponse()
-    resp.message(text)
-    return Response(str(resp), mimetype="application/xml")
-
-
-def _strip_whatsapp_prefix(phone: str) -> str:
-    return (phone or "").replace("whatsapp:", "").strip()
+def _send_text(phone_number_id: str, to: str, body: str) -> None:
+    """Send a WhatsApp text message via Meta Graph API."""
+    token = os.getenv("META_ACCESS_TOKEN")
+    if not token or not phone_number_id:
+        print("[send] missing META_ACCESS_TOKEN or phone_number_id")
+        return
+    url = f"{GRAPH_API}/{phone_number_id}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "text",
+        "text": {"preview_url": False, "body": body[:4096]},
+    }
+    try:
+        r = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(payload),
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            print(f"[send] HTTP {r.status_code}: {r.text}")
+    except Exception as e:
+        print(f"[send] error: {e}")
 
 
 def _handle_message(customer_phone: str, message: str, message_type: str = "text") -> str:
-    """
-    Core routing logic. Returns the reply text to send.
-    Side-effect: saves inbound/outbound messages to DB.
-    """
+    """Core routing logic. Returns the reply text."""
     handle = parse_handle(message)
 
-    # /menu — show onboarding, clear session
     if is_menu_command(handle):
         db.clear_active_bot(customer_phone)
         return MENU_MESSAGE
 
-    # /something — try to switch bots
     if handle:
         bot = db.get_bot_by_handle(handle)
         if not bot:
             return HANDLE_NOT_FOUND
-
-        # Switch session
         db.set_active_bot(customer_phone, bot["id"])
 
-        # If there was extra text after the handle, treat it as an actual question
         extra = get_remaining_message(message)
         if extra:
-            # Save the user's question (without the handle), then reply
             db.save_message(bot["id"], customer_phone, "user", extra, message_type)
             history = db.get_recent_history(bot["id"], customer_phone)
-            # Drop the just-saved message from history so it's not duplicated
             if history and history[-1].get("content") == extra:
                 history = history[:-1]
             reply = ai.generate_reply(bot, extra, history)
             db.save_message(bot["id"], customer_phone, "assistant", reply)
             return reply
 
-        # Otherwise just send the greeting and record it as the bot's first message
         greeting = bot.get("greeting_message") or "Salam! 👋"
         db.save_message(bot["id"], customer_phone, "assistant", greeting)
         return greeting
 
-    # No handle — use active session
     bot = db.get_active_bot(customer_phone)
     if not bot:
         return NO_BOT_MESSAGE
 
-    # Save the inbound message, generate AI reply
     db.save_message(bot["id"], customer_phone, "user", message, message_type)
     history = db.get_recent_history(bot["id"], customer_phone)
     if history and history[-1].get("content") == message:
@@ -113,37 +124,102 @@ def health():
     return {"status": "ok"}
 
 
+@app.route("/whatsapp", methods=["GET"])
+def whatsapp_verify():
+    """
+    Meta webhook verification handshake.
+    https://developers.facebook.com/docs/whatsapp/cloud-api/guides/set-up-webhooks
+    """
+    mode = request.args.get("hub.mode")
+    token = request.args.get("hub.verify_token")
+    challenge = request.args.get("hub.challenge")
+    expected = os.getenv("META_VERIFY_TOKEN", "")
+    if mode == "subscribe" and token == expected and challenge:
+        return challenge, 200
+    return "Forbidden", 403
+
+
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_webhook():
-    from_number = _strip_whatsapp_prefix(request.values.get("From", ""))
-    body = (request.values.get("Body") or "").strip()
-    num_media = int(request.values.get("NumMedia") or 0)
+    """Incoming WhatsApp message from Meta Cloud API."""
+    data = request.get_json(silent=True) or {}
 
-    if not from_number:
-        return _twiml("Bad request.")
+    try:
+        entries = data.get("entry") or []
+        for entry in entries:
+            changes = entry.get("changes") or []
+            for change in changes:
+                value = change.get("value") or {}
+                phone_number_id = (value.get("metadata") or {}).get("phone_number_id")
+                messages = value.get("messages") or []
+                for msg in messages:
+                    _process_one_message(msg, phone_number_id)
+    except Exception as e:
+        print(f"[webhook] error: {e}")
 
-    print(f"[in] from={from_number} body={body!r} media={num_media}")
+    # Always 200 quickly so Meta doesn't retry
+    return jsonify({"ok": True}), 200
 
-    # Voice note path
-    if num_media > 0:
-        media_url = request.values.get("MediaUrl0")
-        media_type = (request.values.get("MediaContentType0") or "").lower()
-        if media_url and media_type.startswith("audio"):
-            transcript = voice.transcribe_from_url(media_url)
-            if not transcript:
-                return _twiml(
-                    "Sesli mesajınızı anlaya bilmədim, "
-                    "zəhmət olmasa yenidən cəhd edin və ya yazılı göndərin."
-                )
-            print(f"[voice] transcript: {transcript!r}")
-            reply = _handle_message(from_number, transcript, message_type="voice")
-            return _twiml(reply)
+
+def _process_one_message(msg: dict, phone_number_id: str | None) -> None:
+    sender = (msg.get("from") or "").strip()
+    mtype = msg.get("type")
+    if not sender or not phone_number_id:
+        return
+
+    # Normalize — Meta sends digits-only ("994501234567"); we keep that format
+    # for sending replies (Meta requires no +). For our DB key we add the +.
+    reply_to = sender  # for Graph API replies, no leading +
+    customer_phone = sender if sender.startswith("+") else f"+{sender}"
+    print(f"[in] from={customer_phone} type={mtype}")
+
+    body: str | None = None
+    message_type = "text"
+
+    if mtype == "text":
+        body = ((msg.get("text") or {}).get("body") or "").strip()
+
+    elif mtype == "audio":
+        media_id = (msg.get("audio") or {}).get("id")
+        if not media_id:
+            _send_text(phone_number_id, reply_to, "Sesli mesajı oxuya bilmədim.")
+            return
+        transcript = voice.transcribe_meta_media(media_id)
+        if not transcript:
+            _send_text(
+                phone_number_id, reply_to,
+                "Sesli mesajınızı anlaya bilmədim, zəhmət olmasa yenidən cəhd edin və ya yazılı göndərin."
+            )
+            return
+        print(f"[voice] transcript: {transcript!r}")
+        body = transcript
+        message_type = "voice"
+
+    elif mtype == "interactive":
+        it = msg.get("interactive") or {}
+        kind = it.get("type")
+        if kind == "button_reply":
+            body = (it.get("button_reply") or {}).get("title")
+        elif kind == "list_reply":
+            body = (it.get("list_reply") or {}).get("title")
+        body = (body or "").strip()
+
+    elif mtype == "button":
+        body = ((msg.get("button") or {}).get("text") or "").strip()
+
+    else:
+        _send_text(
+            phone_number_id, reply_to,
+            "Hələlik yalnız yazılı və sesli mesajları qəbul edirəm."
+        )
+        return
 
     if not body:
-        return _twiml("Boş mesaj qəbul edildi. Zəhmət olmasa mətn yazın.")
+        _send_text(phone_number_id, reply_to, "Boş mesaj qəbul edildi. Zəhmət olmasa mətn yazın.")
+        return
 
-    reply = _handle_message(from_number, body, message_type="text")
-    return _twiml(reply)
+    reply = _handle_message(customer_phone, body, message_type=message_type)
+    _send_text(phone_number_id, reply_to, reply)
 
 
 if __name__ == "__main__":

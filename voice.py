@@ -1,8 +1,9 @@
 """
-Voice note transcription with OpenAI Whisper.
+Voice note transcription with OpenAI Whisper, using Meta Cloud API.
 
-Twilio sends a MediaUrl to the WhatsApp voice note. We download it
-(using Twilio basic auth) and pass to Whisper.
+Meta sends an audio message with a `media_id`. To download the file:
+1. GET https://graph.facebook.com/v20.0/<media-id>  (returns a temporary URL)
+2. GET <that URL>  (with Bearer auth) — returns the raw audio bytes
 """
 from __future__ import annotations
 import os
@@ -12,6 +13,9 @@ import requests
 from openai import OpenAI
 
 _client: Optional[OpenAI] = None
+
+GRAPH_API_VERSION = os.getenv("META_GRAPH_VERSION", "v20.0")
+GRAPH_API = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 
 def client() -> OpenAI:
@@ -24,24 +28,49 @@ def client() -> OpenAI:
     return _client
 
 
-def download_twilio_media(media_url: str) -> Optional[str]:
-    """Download voice file from Twilio (auth required). Returns local path."""
-    sid = os.getenv("TWILIO_ACCOUNT_SID")
-    token = os.getenv("TWILIO_AUTH_TOKEN")
-    if not sid or not token:
+def _suffix_for(mime: str) -> str:
+    mime = (mime or "").lower()
+    if "ogg" in mime or "opus" in mime:
+        return ".ogg"
+    if "mp4" in mime or "m4a" in mime or "aac" in mime:
+        return ".m4a"
+    if "mpeg" in mime or "mp3" in mime:
+        return ".mp3"
+    if "wav" in mime:
+        return ".wav"
+    return ".ogg"  # WhatsApp default
+
+
+def download_meta_media(media_id: str) -> Optional[str]:
+    """Download a Meta-hosted media file. Returns local path or None."""
+    token = os.getenv("META_ACCESS_TOKEN")
+    if not token:
+        print("[voice] missing META_ACCESS_TOKEN")
         return None
     try:
-        r = requests.get(media_url, auth=(sid, token), timeout=20)
+        # Step 1: resolve media_id → temporary download URL
+        meta = requests.get(
+            f"{GRAPH_API}/{media_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        meta.raise_for_status()
+        info = meta.json()
+        url = info.get("url")
+        mime = info.get("mime_type", "")
+        if not url:
+            print(f"[voice] no url in media meta: {info}")
+            return None
+
+        # Step 2: download the binary
+        r = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+        )
         r.raise_for_status()
-        suffix = ".ogg"
-        ct = r.headers.get("Content-Type", "").lower()
-        if "mp3" in ct:
-            suffix = ".mp3"
-        elif "mp4" in ct or "m4a" in ct:
-            suffix = ".m4a"
-        elif "wav" in ct:
-            suffix = ".wav"
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=_suffix_for(mime))
         tmp.write(r.content)
         tmp.flush()
         tmp.close()
@@ -52,7 +81,7 @@ def download_twilio_media(media_url: str) -> Optional[str]:
 
 
 def transcribe(file_path: str, language: str = "az") -> Optional[str]:
-    """Transcribe an audio file with Whisper. Returns text or None."""
+    """Transcribe an audio file with Whisper."""
     try:
         with open(file_path, "rb") as f:
             resp = client().audio.transcriptions.create(
@@ -71,9 +100,9 @@ def transcribe(file_path: str, language: str = "az") -> Optional[str]:
             pass
 
 
-def transcribe_from_url(media_url: str, language: str = "az") -> Optional[str]:
-    """Convenience: download Twilio media then transcribe."""
-    path = download_twilio_media(media_url)
+def transcribe_meta_media(media_id: str, language: str = "az") -> Optional[str]:
+    """Convenience: download Meta media then transcribe."""
+    path = download_meta_media(media_id)
     if not path:
         return None
     return transcribe(path, language=language)

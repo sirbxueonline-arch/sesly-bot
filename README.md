@@ -1,7 +1,8 @@
-# Sesly Bot — WhatsApp AI Webhook
+# Sesly Bot — WhatsApp AI Webhook (Meta Cloud API)
 
-Multi-tenant WhatsApp bot for Sesly. Receives Twilio webhooks, routes by `/handle`
-to the correct bot, transcribes voice notes with Whisper, replies with Claude.
+Multi-tenant WhatsApp bot for Sesly. Receives Meta WhatsApp Cloud API
+webhooks, routes by `/handle` to the correct bot, transcribes voice notes
+with Whisper, and replies with Claude.
 
 ## Deploy to Vercel
 
@@ -12,9 +13,8 @@ to the correct bot, transcribes voice notes with Whisper, replies with Claude.
 
 | Key | Value |
 |---|---|
-| `TWILIO_ACCOUNT_SID` | from Twilio Console |
-| `TWILIO_AUTH_TOKEN` | from Twilio Console |
-| `TWILIO_WHATSAPP_NUMBER` | e.g. `whatsapp:+15559762340` |
+| `META_VERIFY_TOKEN` | any string you choose — must match the one you paste into the Meta dashboard |
+| `META_ACCESS_TOKEN` | permanent token from Meta Business → System Users |
 | `ANTHROPIC_API_KEY` | `sk-ant-…` |
 | `OPENAI_API_KEY` | `sk-proj-…` |
 | `SUPABASE_URL` | `https://xxx.supabase.co` |
@@ -29,10 +29,14 @@ curl https://your-bot.vercel.app/health
 # {"status":"ok"}
 ```
 
-## Point Twilio at it
+## Configure Meta WhatsApp webhook
 
-Twilio Console → Phone Numbers → your number → Messaging Configuration →
-**"A message comes in"** → `https://your-bot.vercel.app/whatsapp` (POST).
+Meta for Developers → your App → **WhatsApp → Configuration** → **Webhook**:
+
+- **Callback URL**: `https://your-bot.vercel.app/whatsapp`
+- **Verify token**: paste the same string you set as `META_VERIFY_TOKEN`
+- Click **Verify and save** — Meta will GET the URL and the bot will echo back the challenge.
+- Under **Webhook fields**, subscribe to **messages**.
 
 ## Local dev
 
@@ -44,12 +48,14 @@ python app.py
 # bot listens on http://localhost:5001
 ```
 
-Expose to Twilio with ngrok / cloudflared if testing locally.
+For local testing, expose via ngrok / cloudflared and paste the public URL
+in Meta's webhook config.
 
 ## Routes
 
 - `GET  /health` — health check
-- `POST /whatsapp` — Twilio webhook (incoming WhatsApp messages)
+- `GET  /whatsapp` — Meta verification handshake
+- `POST /whatsapp` — incoming WhatsApp messages (JSON)
 
 ## Routing rules
 
