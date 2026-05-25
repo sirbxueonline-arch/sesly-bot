@@ -126,7 +126,7 @@ def health():
 
 @app.route("/debug", methods=["GET"])
 def debug():
-    """Diagnostic endpoint — confirms env + DB connectivity."""
+    """Diagnostic endpoint — confirms env + DB + Claude connectivity."""
     out = {
         "env": {
             "SUPABASE_URL": bool(os.getenv("SUPABASE_URL")),
@@ -135,6 +135,7 @@ def debug():
             "META_ACCESS_TOKEN_set": bool(os.getenv("META_ACCESS_TOKEN")),
             "META_VERIFY_TOKEN_set": bool(os.getenv("META_VERIFY_TOKEN")),
             "ANTHROPIC_API_KEY_set": bool(os.getenv("ANTHROPIC_API_KEY")),
+            "ANTHROPIC_API_KEY_starts": (os.getenv("ANTHROPIC_API_KEY") or "")[:10],
             "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
         }
     }
@@ -148,6 +149,24 @@ def debug():
         ][:20]
     except Exception as e:
         out["db_error"] = f"{type(e).__name__}: {e}"
+
+    # Probe Claude
+    try:
+        c = ai.client()
+        resp = c.messages.create(
+            model=ai.MODEL,
+            max_tokens=50,
+            messages=[{"role": "user", "content": "Say 'ok' in one word."}],
+        )
+        out["claude_ok"] = True
+        out["claude_reply"] = "".join(
+            getattr(b, "text", "") for b in resp.content
+        )[:120]
+        out["claude_model"] = ai.MODEL
+    except Exception as e:
+        out["claude_error"] = f"{type(e).__name__}: {e}"
+        out["claude_model_tried"] = ai.MODEL
+
     return out
 
 
