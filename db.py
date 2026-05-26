@@ -456,26 +456,29 @@ def save_booking(
 
 
 def _notify_owner_of_booking(bot_id: str, customer_phone: str, payload: dict) -> None:
-    """Send a WhatsApp ping to the business owner that a booking landed."""
+    """Send a WhatsApp ping to the business owner that a booking landed,
+    and (if Google Calendar is connected for this bot) insert a calendar event."""
     try:
         from notify import send_to_owner
         bot_row = (
             client()
             .table("bots")
-            .select("display_name, businesses(phone, name)")
+            .select(
+                "id, display_name, "
+                "gcal_refresh_token, gcal_calendar_id, "
+                "businesses(phone, name)"
+            )
             .eq("id", bot_id)
             .maybe_single()
             .execute()
         )
         if not bot_row or not bot_row.data:
             return
-        biz = bot_row.data.get("businesses") or {}
+        bot_data = bot_row.data
+        biz = bot_data.get("businesses") or {}
         owner_phone = (biz.get("phone") or "").strip()
-        if not owner_phone:
-            print("[notify] business has no owner phone configured — skipping")
-            return
 
-        biz_name = biz.get("name") or bot_row.data.get("display_name") or "Botunuz"
+        biz_name = biz.get("name") or bot_data.get("display_name") or "Botunuz"
         service = payload.get("service") or "Sifariş"
         when = payload.get("scheduled_at")
         when_display = payload.get("scheduled_time_text")
@@ -487,26 +490,37 @@ def _notify_owner_of_booking(bot_id: str, customer_phone: str, payload: dict) ->
             except Exception:
                 when_display = when
 
-        lines = ["🔔 Yeni randevu", ""]
-        if payload.get("customer_name"):
-            lines.append(f"👤 {payload['customer_name']} · {customer_phone}")
-        else:
-            lines.append(f"👤 {customer_phone}")
-        lines.append(f"🛠  {service}")
-        if when_display:
-            lines.append(f"📅 {when_display}")
-        if payload.get("duration_minutes"):
-            lines.append(f"⏱  {payload['duration_minutes']} dəq")
-        if payload.get("price_azn") is not None:
-            lines.append(f"💰 {payload['price_azn']} AZN")
-        if payload.get("notes"):
-            lines.append(f"📝 {payload['notes']}")
-        lines.append("")
-        lines.append(f"({biz_name})")
+        # WhatsApp owner ping
+        if owner_phone:
+            lines = ["🔔 Yeni randevu", ""]
+            if payload.get("customer_name"):
+                lines.append(f"👤 {payload['customer_name']} · {customer_phone}")
+            else:
+                lines.append(f"👤 {customer_phone}")
+            lines.append(f"🛠  {service}")
+            if when_display:
+                lines.append(f"📅 {when_display}")
+            if payload.get("duration_minutes"):
+                lines.append(f"⏱  {payload['duration_minutes']} dəq")
+            if payload.get("price_azn") is not None:
+                lines.append(f"💰 {payload['price_azn']} AZN")
+            if payload.get("notes"):
+                lines.append(f"📝 {payload['notes']}")
+            lines.append("")
+            lines.append(f"({biz_name})")
 
-        ok = send_to_owner(owner_phone, "\n".join(lines))
-        if ok:
-            print(f"[notify] owner alerted at {owner_phone}")
+            ok = send_to_owner(owner_phone, "\n".join(lines))
+            if ok:
+                print(f"[notify] owner alerted at {owner_phone}")
+        else:
+            print("[notify] business has no owner phone configured — skipping WA")
+
+        # Google Calendar event (no-op if not connected)
+        try:
+            from gcal import create_event_for_booking
+            create_event_for_booking(bot_data, payload, customer_phone)
+        except Exception as e:
+            print(f"[gcal] hook failed: {e}")
     except Exception as e:
         print(f"[notify] failed: {e}")
 
