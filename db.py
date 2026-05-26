@@ -99,48 +99,35 @@ PLAN_LIMITS = {
 
 
 def get_monthly_user_message_count(business_id: str) -> int:
-    """Count customer (user-role) messages in the current calendar month."""
+    """
+    Return the count of customer (user-role) messages in the current calendar
+    month for the business.
+
+    Reads from `usage_ledger` (migration 010) which is incremented by a DB
+    trigger on every messages insert. This count persists even if the user
+    deletes a bot — so it can't be reset to bypass the monthly plan cap.
+    """
     if not business_id:
         return 0
     try:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
-        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-
-        bots = (
-            client()
-            .table("bots")
-            .select("id")
-            .eq("business_id", business_id)
-            .execute()
-        )
-        bot_ids = [b["id"] for b in (bots.data or [])]
-        if not bot_ids:
-            return 0
-
-        convs = (
-            client()
-            .table("conversations")
-            .select("id")
-            .in_("bot_id", bot_ids)
-            .execute()
-        )
-        conv_ids = [c["id"] for c in (convs.data or [])]
-        if not conv_ids:
-            return 0
+        month_key = now.strftime("%Y-%m")
 
         result = (
             client()
-            .table("messages")
-            .select("id", count="exact")
-            .in_("conversation_id", conv_ids)
-            .eq("role", "user")
-            .gte("created_at", month_start)
+            .table("usage_ledger")
+            .select("message_count")
+            .eq("business_id", business_id)
+            .eq("month_key", month_key)
+            .maybe_single()
             .execute()
         )
-        return result.count or 0
+        if result and result.data:
+            return int(result.data.get("message_count") or 0)
+        return 0
     except Exception as e:
-        print(f"[db] message count failed: {e}")
+        print(f"[db] usage_ledger lookup failed: {e}")
         return 0
 
 
