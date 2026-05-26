@@ -27,6 +27,35 @@ from router import (
     is_menu_command,
 )
 
+
+def _away_response(bot: dict) -> str | None:
+    """If the bot has 'away mode' active right now, return the away text.
+    Otherwise None and we run the normal pipeline."""
+    if not bot.get("away_enabled"):
+        return None
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    starts = bot.get("away_starts_at")
+    ends = bot.get("away_ends_at")
+    try:
+        if starts:
+            s_dt = datetime.fromisoformat(starts.replace("Z", "+00:00"))
+            if s_dt > now:
+                return None
+        if ends:
+            e_dt = datetime.fromisoformat(ends.replace("Z", "+00:00"))
+            if e_dt < now:
+                return None
+    except Exception as e:
+        print(f"[away] could not parse window: {e}")
+        return None
+    msg = (bot.get("away_message") or "").strip()
+    return (
+        msg
+        or "Salam! Bot hazırda tətildədir. Tezliklə qayıdacağıq 🌴"
+    )
+
 load_dotenv()
 
 app = Flask(__name__)
@@ -90,6 +119,12 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
             return HANDLE_NOT_FOUND
         db.set_active_bot(customer_phone, bot["id"])
 
+        away = _away_response(bot)
+        if away:
+            db.save_message(bot["id"], customer_phone, "user", message, message_type)
+            db.save_message(bot["id"], customer_phone, "assistant", away)
+            return away
+
         extra = get_remaining_message(message)
         if extra:
             # Plan limit check (before saving anything, so we don't bloat counts)
@@ -124,6 +159,12 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
     # Plan limit check
     if db.is_over_message_limit(bot):
         return LIMIT_REACHED_MESSAGE
+
+    away = _away_response(bot)
+    if away:
+        db.save_message(bot["id"], customer_phone, "user", message, message_type)
+        db.save_message(bot["id"], customer_phone, "assistant", away)
+        return away
 
     db.save_message(bot["id"], customer_phone, "user", message, message_type)
     history = db.get_recent_history(bot["id"], customer_phone)
