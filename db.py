@@ -369,8 +369,11 @@ def save_booking(
     scheduled_time_text = booking.get("time_text") or None
 
     if date and time and len(date) == 10 and len(time) >= 4:
-        # Combine into UTC-naive ISO. Postgres will treat as timestamptz (UTC).
-        scheduled_at = f"{date}T{time}:00"
+        # The AI prompt anchors everything to Bakı vaxtı (UTC+4), so the time
+        # we receive is Baku-local. Stamp the offset explicitly so Postgres
+        # stores the correct UTC instant and downstream consumers (Google
+        # Calendar, dashboard) display the right wall-clock time.
+        scheduled_at = f"{date}T{time}:00+04:00"
         scheduled_time_text = scheduled_time_text or f"{date} {time}"
 
     status = (booking.get("status") or "confirmed").strip().lower()
