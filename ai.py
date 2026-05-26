@@ -168,6 +168,29 @@ _BOOKING_RE = re.compile(
 )
 
 
+# WhatsApp doesn't render markdown consistently across clients (Web vs phone,
+# light vs dark). To avoid stray *asterisks* and _underscores_ leaking through,
+# we strip them all from the AI reply. Bold/italic just become plain text.
+_MD_PATTERNS = [
+    (re.compile(r"\*\*([^*\n]+?)\*\*"), r"\1"),  # **bold**
+    (re.compile(r"\*([^*\n]+?)\*"), r"\1"),      # *bold*
+    (re.compile(r"__([^_\n]+?)__"), r"\1"),      # __bold__
+    (re.compile(r"(?<!\w)_([^_\n]+?)_(?!\w)"), r"\1"),  # _italic_ (avoid mid-word)
+    (re.compile(r"~~([^~\n]+?)~~"), r"\1"),      # ~~strike~~
+    (re.compile(r"~([^~\n]+?)~"), r"\1"),        # ~strike~
+    (re.compile(r"`([^`\n]+?)`"), r"\1"),        # `code`
+    (re.compile(r"^#{1,6}\s+", re.MULTILINE), ""),   # # heading
+    (re.compile(r"^>\s+", re.MULTILINE), ""),        # > quote
+]
+
+def _strip_markdown(text: str) -> str:
+    if not text:
+        return text
+    for pat, repl in _MD_PATTERNS:
+        text = pat.sub(repl, text)
+    return text
+
+
 def extract_booking(text: str) -> Tuple[str, Optional[dict]]:
     """
     Pull a [BOOKING]{...}[/BOOKING] payload out of the AI reply.
@@ -232,6 +255,7 @@ def generate_reply_with_booking(
         if text:
             print(f"[ai] raw reply ({len(text)} chars): {text[:400]!r}")
             cleaned, booking = extract_booking(text)
+            cleaned = _strip_markdown(cleaned)
             if booking:
                 print(f"[ai] extracted booking: {booking}")
             else:
