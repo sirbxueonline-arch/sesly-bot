@@ -68,6 +68,61 @@ GRAPH_API = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 # Send / verify helpers
 # ---------------------------------------------------------------------------
 
+def _send_audio(phone_number_id: str, to: str, local_path: str) -> None:
+    """Upload a local audio file to Meta, then send it as a WhatsApp audio msg."""
+    token = os.getenv("META_ACCESS_TOKEN")
+    if not token or not phone_number_id:
+        return
+
+    # 1) Upload to Meta media library
+    try:
+        with open(local_path, "rb") as f:
+            up = requests.post(
+                f"{GRAPH_API}/{phone_number_id}/media",
+                headers={"Authorization": f"Bearer {token}"},
+                data={"messaging_product": "whatsapp", "type": "audio/mpeg"},
+                files={"file": ("reply.mp3", f, "audio/mpeg")},
+                timeout=30,
+            )
+        if up.status_code >= 400:
+            print(f"[audio] upload HTTP {up.status_code}: {up.text[:300]}")
+            return
+        media_id = up.json().get("id")
+        if not media_id:
+            print(f"[audio] upload returned no id: {up.text[:300]}")
+            return
+    except Exception as e:
+        print(f"[audio] upload error: {e}")
+        return
+
+    # 2) Send the audio message
+    try:
+        r = requests.post(
+            f"{GRAPH_API}/{phone_number_id}/messages",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": to,
+                "type": "audio",
+                "audio": {"id": media_id},
+            },
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            print(f"[audio] send HTTP {r.status_code}: {r.text[:300]}")
+    except Exception as e:
+        print(f"[audio] send error: {e}")
+    finally:
+        try:
+            os.unlink(local_path)
+        except Exception:
+            pass
+
+
 def _send_text(phone_number_id: str, to: str, body: str) -> None:
     """Send a WhatsApp text message via Meta Graph API."""
     token = os.getenv("META_ACCESS_TOKEN")
@@ -105,31 +160,31 @@ LIMIT_REACHED_MESSAGE = (
 )
 
 
-def _handle_message(customer_phone: str, message: str, message_type: str = "text") -> str:
-    """Core routing logic. Returns the reply text."""
+def _handle_message(customer_phone: str, message: str, message_type: str = "text"):
+    """Core routing logic. Returns (reply_text, bot_dict_or_None)."""
     handle = parse_handle(message)
 
     if is_menu_command(handle):
         db.clear_active_bot(customer_phone)
-        return MENU_MESSAGE
+        return MENU_MESSAGE, None
 
     if handle:
         bot = db.get_bot_by_handle(handle)
         if not bot:
-            return HANDLE_NOT_FOUND
+            return HANDLE_NOT_FOUND, None
         db.set_active_bot(customer_phone, bot["id"])
 
         away = _away_response(bot)
         if away:
             db.save_message(bot["id"], customer_phone, "user", message, message_type)
             db.save_message(bot["id"], customer_phone, "assistant", away)
-            return away
+            return away, bot
 
         extra = get_remaining_message(message)
         if extra:
             # Plan limit check (before saving anything, so we don't bloat counts)
             if db.is_over_message_limit(bot):
-                return LIMIT_REACHED_MESSAGE
+                return LIMIT_REACHED_MESSAGE, bot
             db.save_message(bot["id"], customer_phone, "user", extra, message_type)
             history = db.get_recent_history(bot["id"], customer_phone)
             if history and history[-1].get("content") == extra:
@@ -138,11 +193,11 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
             db.save_message(bot["id"], customer_phone, "assistant", reply)
             if booking:
                 db.save_booking(bot["id"], customer_phone, booking)
-            return reply
+            return reply, bot
 
         greeting = bot.get("greeting_message") or "Salam! 👋"
         db.save_message(bot["id"], customer_phone, "assistant", greeting)
-        return greeting
+        return greeting, bot
 
     bot = db.get_active_bot(customer_phone)
     if not bot:
@@ -154,17 +209,17 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
             db.set_active_bot(customer_phone, bot["id"])
             print(f"[router] no handle, no session → falling back to /sesly")
         else:
-            return NO_BOT_MESSAGE
+            return NO_BOT_MESSAGE, None
 
     # Plan limit check
     if db.is_over_message_limit(bot):
-        return LIMIT_REACHED_MESSAGE
+        return LIMIT_REACHED_MESSAGE, bot
 
     away = _away_response(bot)
     if away:
         db.save_message(bot["id"], customer_phone, "user", message, message_type)
         db.save_message(bot["id"], customer_phone, "assistant", away)
-        return away
+        return away, bot
 
     db.save_message(bot["id"], customer_phone, "user", message, message_type)
     history = db.get_recent_history(bot["id"], customer_phone)
@@ -174,7 +229,7 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
     db.save_message(bot["id"], customer_phone, "assistant", reply)
     if booking:
         db.save_booking(bot["id"], customer_phone, booking)
-    return reply
+    return reply, bot
 
 
 # ---------------------------------------------------------------------------
@@ -420,8 +475,24 @@ def _process_one_message(msg: dict, phone_number_id: str | None) -> None:
         _send_text(phone_number_id, reply_to, "Boş mesaj qəbul edildi. Zəhmət olmasa mətn yazın.")
         return
 
-    reply = _handle_message(customer_phone, body, message_type=message_type)
+    reply, served_by = _handle_message(customer_phone, body, message_type=message_type)
     _send_text(phone_number_id, reply_to, reply)
+
+    # Optional voice reply: only when the user spoke AND the bot is configured
+    # for sesli cavablar AND TTS is configured. Best-effort; never blocks text.
+    try:
+        if (
+            message_type == "voice"
+            and served_by
+            and served_by.get("voice_reply_enabled")
+        ):
+            import tts
+            if tts.is_configured():
+                audio_path = tts.synthesize(reply, served_by.get("voice_voice_id"))
+                if audio_path:
+                    _send_audio(phone_number_id, reply_to, audio_path)
+    except Exception as e:
+        print(f"[voice-reply] best-effort failed: {e}")
 
 
 if __name__ == "__main__":
