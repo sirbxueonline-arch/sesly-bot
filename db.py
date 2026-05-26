@@ -69,6 +69,27 @@ def get_bot_by_handle(handle: str) -> Optional[dict]:
     return None
 
 
+def get_bot_by_id(bot_id: str) -> Optional[dict]:
+    """Look up bot config by id. Used by the dashboard preview endpoint."""
+    bid = (bot_id or "").strip()
+    if not bid:
+        return None
+    try:
+        result = (
+            client()
+            .table("bots")
+            .select("*, businesses(name, type, plan, user_id)")
+            .eq("id", bid)
+            .maybe_single()
+            .execute()
+        )
+        if result and result.data:
+            return result.data
+    except Exception as e:
+        print(f"[db] get_bot_by_id failed: {e}")
+    return None
+
+
 # Plan limits — mirrors lib/plans.ts in the dashboard
 PLAN_LIMITS = {
     "free":  {"messages": 100,  "bots": 1, "name": "Sınaq"},

@@ -196,6 +196,64 @@ def debug():
     return out
 
 
+@app.route("/preview", methods=["POST", "OPTIONS"])
+def preview():
+    """
+    Dashboard preview endpoint — runs the bot's prompt against a test
+    message WITHOUT touching WhatsApp or persisting the conversation.
+
+    Auth: shared secret in `X-Sesly-Preview-Token` header
+          (env: SESLY_PREVIEW_TOKEN).
+
+    Body:
+      {
+        "bot_id":  "<uuid>",
+        "message": "<user text>",
+        "history": [{"role":"user|assistant","content":"..."}]  # optional
+      }
+    Returns: { "reply": "<text>" }
+    """
+    # Lightweight CORS preflight handling for browser-side fetches if needed
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Sesly-Preview-Token"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        return resp
+
+    expected = os.getenv("SESLY_PREVIEW_TOKEN")
+    if not expected:
+        return jsonify({"error": "preview_token_not_configured"}), 503
+    if request.headers.get("X-Sesly-Preview-Token") != expected:
+        return jsonify({"error": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    bot_id = (payload.get("bot_id") or "").strip()
+    message = (payload.get("message") or "").strip()
+    history = payload.get("history") or []
+    if not bot_id or not message:
+        return jsonify({"error": "bot_id and message are required"}), 400
+
+    bot = db.get_bot_by_id(bot_id)
+    if not bot:
+        return jsonify({"error": "bot_not_found"}), 404
+
+    # Only keep valid history turns
+    clean_history = []
+    for m in history[-20:] if isinstance(history, list) else []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            clean_history.append({"role": role, "content": content})
+
+    reply, booking = ai.generate_reply_with_booking(bot, message, clean_history)
+    resp = jsonify({"reply": reply, "booking": booking})
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
 @app.route("/whatsapp", methods=["GET"])
 def whatsapp_verify():
     """
