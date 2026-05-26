@@ -1,26 +1,35 @@
 """
-Claude (Anthropic) reply generation, with per-bot system prompts.
+OpenAI GPT reply generation, with per-bot system prompts.
+
+We use OpenAI (not Claude) because GPT-4o handles Azerbaijani noticeably
+better — less unwanted Türkce-bleed, more idiomatic AZ phrasing. The
+OpenAI client is already in our stack for Whisper transcription, so no
+extra dependency.
+
+Model is configurable via AI_MODEL env var. Defaults to gpt-4o-mini
+(cheap + good AZ); set AI_MODEL=gpt-4o for premium quality at ~16x
+the cost.
 """
 from __future__ import annotations
 import os
 import re
 import json
 from typing import Optional, Tuple
-from anthropic import Anthropic
+from openai import OpenAI
 
-_client: Optional[Anthropic] = None
+_client: Optional[OpenAI] = None
 
-MODEL = "claude-haiku-4-5"
+MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
 MAX_TOKENS = 600
 
 
-def client() -> Anthropic:
+def client() -> OpenAI:
     global _client
     if _client is None:
-        key = os.getenv("ANTHROPIC_API_KEY")
+        key = os.getenv("OPENAI_API_KEY")
         if not key:
-            raise RuntimeError("ANTHROPIC_API_KEY must be set")
-        _client = Anthropic(api_key=key)
+            raise RuntimeError("OPENAI_API_KEY must be set")
+        _client = OpenAI(api_key=key)
     return _client
 
 
@@ -232,7 +241,8 @@ def generate_reply_with_booking(
     """
     system = build_system_prompt(bot)
 
-    messages: list[dict] = []
+    # OpenAI puts system as the first message in the messages array
+    messages: list[dict] = [{"role": "system", "content": system}]
     for m in history:
         role = m.get("role")
         content = (m.get("content") or "").strip()
@@ -241,19 +251,15 @@ def generate_reply_with_booking(
     messages.append({"role": "user", "content": user_message})
 
     try:
-        resp = client().messages.create(
+        resp = client().chat.completions.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            system=system,
             messages=messages,
+            temperature=0.7,
         )
-        chunks = []
-        for block in resp.content:
-            if getattr(block, "type", None) == "text":
-                chunks.append(block.text)
-        text = "".join(chunks).strip()
+        text = ((resp.choices[0].message.content if resp.choices else "") or "").strip()
         if text:
-            print(f"[ai] raw reply ({len(text)} chars): {text[:400]!r}")
+            print(f"[ai] raw reply ({len(text)} chars, model={MODEL}): {text[:400]!r}")
             cleaned, booking = extract_booking(text)
             cleaned = _strip_markdown(cleaned)
             if booking:
@@ -262,7 +268,7 @@ def generate_reply_with_booking(
                 print("[ai] no booking tag found in reply")
             return cleaned, booking
     except Exception as e:
-        print(f"[ai] generation failed: {e}")
+        print(f"[ai] generation failed ({MODEL}): {e}")
 
     return (
         "Üzr istəyirəm, hal-hazırda cavab verə bilmirəm. "

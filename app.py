@@ -276,7 +276,7 @@ def health():
 
 @app.route("/debug", methods=["GET"])
 def debug():
-    """Diagnostic endpoint — confirms env + DB + Claude connectivity."""
+    """Diagnostic endpoint — confirms env + DB + OpenAI connectivity."""
     out = {
         "env": {
             "SUPABASE_URL": bool(os.getenv("SUPABASE_URL")),
@@ -284,9 +284,8 @@ def debug():
             "SUPABASE_SERVICE_ROLE_KEY_starts": (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "")[:6],
             "META_ACCESS_TOKEN_set": bool(os.getenv("META_ACCESS_TOKEN")),
             "META_VERIFY_TOKEN_set": bool(os.getenv("META_VERIFY_TOKEN")),
-            "ANTHROPIC_API_KEY_set": bool(os.getenv("ANTHROPIC_API_KEY")),
-            "ANTHROPIC_API_KEY_starts": (os.getenv("ANTHROPIC_API_KEY") or "")[:10],
             "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
+            "AI_MODEL": ai.MODEL,
         }
     }
     # Probe DB
@@ -300,22 +299,21 @@ def debug():
     except Exception as e:
         out["db_error"] = f"{type(e).__name__}: {e}"
 
-    # Probe Claude
+    # Probe OpenAI chat completions (using the same client + model as the
+    # main reply path)
     try:
         c = ai.client()
-        resp = c.messages.create(
+        resp = c.chat.completions.create(
             model=ai.MODEL,
-            max_tokens=50,
-            messages=[{"role": "user", "content": "Say 'ok' in one word."}],
+            max_tokens=10,
+            messages=[{"role": "user", "content": "Reply with the word 'ok' only."}],
         )
-        out["claude_ok"] = True
-        out["claude_reply"] = "".join(
-            getattr(b, "text", "") for b in resp.content
-        )[:120]
-        out["claude_model"] = ai.MODEL
+        out["openai_ok"] = True
+        out["openai_reply"] = (resp.choices[0].message.content or "")[:120] if resp.choices else ""
+        out["openai_model"] = ai.MODEL
     except Exception as e:
-        out["claude_error"] = f"{type(e).__name__}: {e}"
-        out["claude_model_tried"] = ai.MODEL
+        out["openai_error"] = f"{type(e).__name__}: {e}"
+        out["openai_model_tried"] = ai.MODEL
 
     return out
 
