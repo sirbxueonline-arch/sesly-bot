@@ -196,6 +196,37 @@ def debug():
     return out
 
 
+@app.route("/cron/digest", methods=["GET", "POST"])
+def cron_digest():
+    """
+    Daily owner digest — triggered by Vercel cron at 16:00 UTC (20:00 Baku).
+
+    Auth: Vercel cron sends `Authorization: Bearer ${CRON_SECRET}`; we
+    accept that, or alternatively a shared token via `X-Sesly-Cron-Token`
+    for manual runs.
+    """
+    cron_secret = os.getenv("CRON_SECRET")
+    fallback_token = os.getenv("SESLY_CRON_TOKEN")
+
+    auth_ok = False
+    auth_header = request.headers.get("Authorization", "")
+    if cron_secret and auth_header == f"Bearer {cron_secret}":
+        auth_ok = True
+    elif fallback_token and request.headers.get("X-Sesly-Cron-Token") == fallback_token:
+        auth_ok = True
+
+    if not auth_ok:
+        return jsonify({"error": "unauthorized"}), 401
+
+    from digest import run_daily_digest
+    try:
+        result = run_daily_digest()
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        print(f"[cron] digest failed: {type(e).__name__}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/preview", methods=["POST", "OPTIONS"])
 def preview():
     """
