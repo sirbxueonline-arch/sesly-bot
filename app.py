@@ -68,8 +68,11 @@ GRAPH_API = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 # Send / verify helpers
 # ---------------------------------------------------------------------------
 
-def _send_audio(phone_number_id: str, to: str, local_path: str) -> None:
+def _send_audio(phone_number_id: str, to: str, local_path: str) -> dict:
     """Upload a local audio file to Meta, then send it as a WhatsApp audio msg.
+
+    Returns a dict {ok: bool, error?: str, kind?: 'voice_note'|'attachment'}.
+    Old callers can safely ignore the return value.
 
     Detects MIME from extension. OGG/Opus uploads are rendered by WhatsApp
     as voice notes (waveform UI). MP3 uploads render as audio attachments
@@ -77,7 +80,7 @@ def _send_audio(phone_number_id: str, to: str, local_path: str) -> None:
     """
     token = os.getenv("META_ACCESS_TOKEN")
     if not token or not phone_number_id:
-        return
+        return {"ok": False, "error": "missing META_ACCESS_TOKEN or phone_number_id"}
 
     ext = os.path.splitext(local_path)[1].lower()
     if ext == ".ogg":
@@ -101,16 +104,18 @@ def _send_audio(phone_number_id: str, to: str, local_path: str) -> None:
                 timeout=30,
             )
         if up.status_code >= 400:
-            print(f"[audio] upload HTTP {up.status_code}: {up.text[:300]}")
-            return
+            msg = f"meta upload {up.status_code}: {up.text[:300]}"
+            print(f"[audio] {msg}")
+            return {"ok": False, "error": msg}
         media_id = up.json().get("id")
         if not media_id:
-            print(f"[audio] upload returned no id: {up.text[:300]}")
-            return
+            msg = f"meta upload no id: {up.text[:300]}"
+            print(f"[audio] {msg}")
+            return {"ok": False, "error": msg}
         print(f"[audio] uploaded media={media_id} mime={mime}")
     except Exception as e:
         print(f"[audio] upload error: {e}")
-        return
+        return {"ok": False, "error": f"upload exception: {e}"}
 
     # 2) Send the audio message
     try:
@@ -130,11 +135,15 @@ def _send_audio(phone_number_id: str, to: str, local_path: str) -> None:
             timeout=15,
         )
         if r.status_code >= 400:
-            print(f"[audio] send HTTP {r.status_code}: {r.text[:300]}")
-        else:
-            print(f"[audio] sent to {to} (rendered as {'voice note' if ext == '.ogg' else 'audio attachment'})")
+            msg = f"meta send {r.status_code}: {r.text[:300]}"
+            print(f"[audio] {msg}")
+            return {"ok": False, "error": msg}
+        kind = "voice_note" if ext == ".ogg" else "attachment"
+        print(f"[audio] sent to {to} (rendered as {kind.replace('_', ' ')})")
+        return {"ok": True, "kind": kind}
     except Exception as e:
         print(f"[audio] send error: {e}")
+        return {"ok": False, "error": f"send exception: {e}"}
     finally:
         try:
             os.unlink(local_path)
@@ -309,6 +318,131 @@ def debug():
         out["claude_model_tried"] = ai.MODEL
 
     return out
+
+
+@app.route("/voice-test", methods=["POST", "OPTIONS"])
+def voice_test():
+    """
+    Run the full TTS → WhatsApp voice-note pipeline once and return a
+    detailed report. Surfaces the exact reason if anything fails so the
+    dashboard can show it to the owner.
+
+    Auth: shared `X-Sesly-Preview-Token` (same secret used by /preview).
+
+    Body: {bot_id, to_phone, text?}
+    Returns: {
+      ok: bool,
+      stages: { config, db_lookup, synthesize, send },
+      voice_id, text_synthesized, error?
+    }
+    """
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Sesly-Preview-Token"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        return resp
+
+    expected = os.getenv("SESLY_PREVIEW_TOKEN")
+    if not expected:
+        return jsonify({"ok": False, "stage": "auth", "error": "preview_token_not_configured"}), 503
+    if request.headers.get("X-Sesly-Preview-Token") != expected:
+        return jsonify({"ok": False, "stage": "auth", "error": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    bot_id = (payload.get("bot_id") or "").strip()
+    to_phone = (payload.get("to_phone") or "").strip()
+    text = (payload.get("text") or "Salam! Bu Sesly səsli cavab testidir.").strip()
+    if not bot_id or not to_phone:
+        return jsonify({"ok": False, "stage": "input", "error": "bot_id and to_phone required"}), 400
+
+    report = {
+        "ok": False,
+        "bot_id": bot_id,
+        "to_phone": to_phone,
+        "text_synthesized": text,
+        "voice_id": None,
+        "stages": {},
+    }
+
+    # Stage 1: env config
+    import tts
+    api_key_set = bool(os.getenv("ELEVENLABS_API_KEY"))
+    default_voice = os.getenv("ELEVENLABS_DEFAULT_VOICE")
+    meta_token = bool(os.getenv("META_ACCESS_TOKEN"))
+    meta_phone_id = os.getenv("META_PHONE_NUMBER_ID")
+    report["stages"]["config"] = {
+        "elevenlabs_api_key": api_key_set,
+        "elevenlabs_default_voice": default_voice or None,
+        "meta_access_token": meta_token,
+        "meta_phone_number_id": bool(meta_phone_id),
+    }
+    if not api_key_set:
+        report["error"] = "ELEVENLABS_API_KEY not set on sesly-bot Vercel project"
+        return jsonify(report), 200
+    if not meta_token or not meta_phone_id:
+        report["error"] = "META_ACCESS_TOKEN / META_PHONE_NUMBER_ID not set on sesly-bot"
+        return jsonify(report), 200
+
+    # Stage 2: DB lookup (so we surface migration 008 missing as a real error)
+    try:
+        bot_row = db.get_bot_by_id(bot_id)
+    except Exception as e:
+        report["stages"]["db_lookup"] = {"ok": False, "error": str(e)}
+        report["error"] = f"db lookup failed: {e}"
+        return jsonify(report), 200
+    if not bot_row:
+        report["stages"]["db_lookup"] = {"ok": False, "error": "bot not found"}
+        report["error"] = "Bot tapılmadı"
+        return jsonify(report), 200
+    voice_reply_enabled_in_db = bot_row.get("voice_reply_enabled")
+    voice_voice_id = bot_row.get("voice_voice_id")
+    report["stages"]["db_lookup"] = {
+        "ok": True,
+        "voice_reply_enabled": voice_reply_enabled_in_db,
+        "voice_voice_id": voice_voice_id,
+        "voice_reply_enabled_column_exists": voice_reply_enabled_in_db is not None
+            or "voice_reply_enabled" in bot_row,
+    }
+    if "voice_reply_enabled" not in bot_row:
+        report["error"] = (
+            "Migration 008 hələ tətbiq edilməyib (voice_reply_enabled sütunu yoxdur). "
+            "Supabase SQL Editor → run sesly/supabase/migrations/008_integrations_scaffold.sql"
+        )
+        return jsonify(report), 200
+
+    chosen_voice = voice_voice_id or default_voice or tts.DEFAULT_VOICE_ID
+    report["voice_id"] = chosen_voice
+
+    # Stage 3: synthesize
+    try:
+        audio_path = tts.synthesize(text, chosen_voice)
+    except Exception as e:
+        report["stages"]["synthesize"] = {"ok": False, "error": str(e)}
+        report["error"] = f"synthesize exception: {e}"
+        return jsonify(report), 200
+    if not audio_path:
+        report["stages"]["synthesize"] = {"ok": False, "error": "synthesize returned None — check ELEVENLABS_API_KEY validity or quota"}
+        report["error"] = "ElevenLabs synthesis failed (check logs for HTTP code)"
+        return jsonify(report), 200
+    report["stages"]["synthesize"] = {
+        "ok": True,
+        "format": "ogg/opus" if audio_path.endswith(".ogg") else "mp3 (no ffmpeg)",
+    }
+
+    # Stage 4: send to WhatsApp
+    send_result = _send_audio(meta_phone_id, to_phone, audio_path)
+    report["stages"]["send"] = send_result
+    if not send_result.get("ok"):
+        report["error"] = send_result.get("error") or "WhatsApp send failed"
+        return jsonify(report), 200
+
+    report["ok"] = True
+    report["message"] = (
+        "Səsli cavab göndərildi 🎉 WhatsApp-da yoxlayın. "
+        f"({'voice note' if send_result.get('kind') == 'voice_note' else 'audio attachment'})"
+    )
+    return jsonify(report), 200
 
 
 @app.route("/cron/digest", methods=["GET", "POST"])
