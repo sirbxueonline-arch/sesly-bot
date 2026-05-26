@@ -246,6 +246,93 @@ def save_message(
         pass
 
 
+def _parse_scheduled(value):
+    """
+    Parse a scheduled_at value into a UTC-naive datetime, truncated to the
+    minute. Returns None if it can't be parsed. Handles all of:
+      - "2026-05-26T14:00:00"          (AI emits this)
+      - "2026-05-26T14:00:00+00:00"   (Postgres returns this)
+      - "2026-05-26T14:00:00Z"
+      - datetime objects
+    """
+    if not value:
+        return None
+    try:
+        from datetime import datetime
+        if hasattr(value, "isoformat"):
+            dt = value
+        else:
+            s = str(value).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt.replace(second=0, microsecond=0)
+    except Exception:
+        return None
+
+
+def _should_merge_booking(old: dict, new_payload: dict, now_utc):
+    """
+    Decide whether the new booking should UPDATE the existing one.
+    Returns (bool, reason).
+    """
+    old_at = _parse_scheduled(old.get("scheduled_at"))
+    new_at = _parse_scheduled(new_payload.get("scheduled_at"))
+
+    # 1) Same parsed slot → same appointment, definitely merge
+    if old_at and new_at and old_at == new_at:
+        return True, "same scheduled_at slot"
+
+    # 2) Same service name (case-insensitive) → same appointment
+    old_svc = (old.get("service") or "").strip().lower()
+    new_svc = (new_payload.get("service") or "").strip().lower()
+    if old_svc and new_svc and old_svc == new_svc:
+        return True, "same service"
+
+    # 3) Old was pending and new is confirmed within 30 min → status upgrade
+    try:
+        from datetime import datetime, timezone
+        old_created = old.get("created_at")
+        if old_created:
+            s = old_created
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            old_created_dt = datetime.fromisoformat(s)
+            if old_created_dt.tzinfo is None:
+                old_created_dt = old_created_dt.replace(tzinfo=timezone.utc)
+            age_min = (now_utc - old_created_dt).total_seconds() / 60
+            if (
+                old.get("status") == "pending"
+                and new_payload.get("status") == "confirmed"
+                and age_min < 30
+            ):
+                return True, f"pending → confirmed within {int(age_min)} min"
+    except Exception:
+        pass
+
+    # 4) Both lack scheduled_at AND created within last 10 min → same convo
+    if not old_at and not new_at:
+        try:
+            from datetime import datetime, timezone
+            old_created = old.get("created_at")
+            if old_created:
+                s = old_created
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                old_created_dt = datetime.fromisoformat(s)
+                if old_created_dt.tzinfo is None:
+                    old_created_dt = old_created_dt.replace(tzinfo=timezone.utc)
+                age_min = (now_utc - old_created_dt).total_seconds() / 60
+                if age_min < 10:
+                    return True, "no slot, same recent conversation"
+        except Exception:
+            pass
+
+    return False, "different appointment"
+
+
 def save_booking(
     bot_id: str,
     customer_phone: str,
@@ -288,50 +375,47 @@ def save_booking(
     # Strip Nones — Postgres prefers omitted over null for some columns
     payload = {k: v for k, v in payload.items() if v is not None}
 
-    # Dedup: if we already created a booking for the SAME (bot, phone) in the
-    # last 2 hours, update it instead of inserting a new one. This handles the
-    # "pending → confirmed" flow where the AI emits two booking tags across
-    # consecutive turns for the same appointment.
+    # Dedup: find the most recent booking for the SAME (bot, phone) in the last
+    # 4 hours. If it's clearly the same appointment (matching slot, OR same
+    # service, OR recent pending row from the same conversation), UPDATE
+    # instead of INSERT.
     try:
         from datetime import datetime, timezone, timedelta
-        two_hours_ago = (
-            datetime.now(timezone.utc) - timedelta(hours=2)
-        ).isoformat()
+
+        now_utc = datetime.now(timezone.utc)
+        window_start = (now_utc - timedelta(hours=4)).isoformat()
+
         existing = (
             client()
             .table("bookings")
-            .select("id, scheduled_at, status")
+            .select("id, scheduled_at, status, service, created_at")
             .eq("bot_id", bot_id)
             .eq("customer_phone", customer_phone)
-            .gte("created_at", two_hours_ago)
+            .gte("created_at", window_start)
             .order("created_at", desc=True)
             .limit(1)
             .execute()
         )
         if existing.data:
             old = existing.data[0]
-            old_at = old.get("scheduled_at")
-            new_at = payload.get("scheduled_at")
-
-            # Match if:
-            #  • same time slot, OR
-            #  • either side has no scheduled_at (treat as same conversation),
-            #    OR the new booking is just upgrading status
-            same_slot = (old_at == new_at) or (old_at and new_at and old_at == new_at)
-            either_missing = old_at is None or new_at is None
-            status_upgrade = (
-                old.get("status") == "pending"
-                and payload.get("status") == "confirmed"
+            should_update, reason = _should_merge_booking(old, payload, now_utc)
+            print(
+                f"[booking] dedup check: old_at={old.get('scheduled_at')!r} "
+                f"new_at={payload.get('scheduled_at')!r} "
+                f"old_status={old.get('status')} new_status={payload.get('status')} "
+                f"→ merge={should_update} ({reason})"
             )
-            if same_slot or either_missing or status_upgrade:
-                update_payload = {k: v for k, v in payload.items() if k not in ("conversation_id",)}
+            if should_update:
+                update_payload = {
+                    k: v for k, v in payload.items() if k not in ("conversation_id",)
+                }
                 client().table("bookings").update(update_payload).eq("id", old["id"]).execute()
-                print(
-                    f"[booking] updated existing {old['id'][:8]}… "
-                    f"({old.get('status')} → {payload.get('status')})"
-                )
-                # Notify the owner only on transitions INTO confirmed
-                if status_upgrade and payload.get("status") == "confirmed":
+                print(f"[booking] updated existing {old['id'][:8]}… ({reason})")
+                # Notify the owner only when transitioning INTO confirmed
+                if (
+                    old.get("status") != "confirmed"
+                    and payload.get("status") == "confirmed"
+                ):
                     _notify_owner_of_booking(bot_id, customer_phone, payload)
                 return
     except Exception as e:
