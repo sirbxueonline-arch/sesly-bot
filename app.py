@@ -69,10 +69,26 @@ GRAPH_API = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 # ---------------------------------------------------------------------------
 
 def _send_audio(phone_number_id: str, to: str, local_path: str) -> None:
-    """Upload a local audio file to Meta, then send it as a WhatsApp audio msg."""
+    """Upload a local audio file to Meta, then send it as a WhatsApp audio msg.
+
+    Detects MIME from extension. OGG/Opus uploads are rendered by WhatsApp
+    as voice notes (waveform UI). MP3 uploads render as audio attachments
+    with a play button.
+    """
     token = os.getenv("META_ACCESS_TOKEN")
     if not token or not phone_number_id:
         return
+
+    ext = os.path.splitext(local_path)[1].lower()
+    if ext == ".ogg":
+        mime = "audio/ogg"
+        filename = "reply.ogg"
+    elif ext in (".m4a", ".aac"):
+        mime = "audio/mp4"
+        filename = "reply.m4a"
+    else:
+        mime = "audio/mpeg"
+        filename = "reply.mp3"
 
     # 1) Upload to Meta media library
     try:
@@ -80,8 +96,8 @@ def _send_audio(phone_number_id: str, to: str, local_path: str) -> None:
             up = requests.post(
                 f"{GRAPH_API}/{phone_number_id}/media",
                 headers={"Authorization": f"Bearer {token}"},
-                data={"messaging_product": "whatsapp", "type": "audio/mpeg"},
-                files={"file": ("reply.mp3", f, "audio/mpeg")},
+                data={"messaging_product": "whatsapp", "type": mime},
+                files={"file": (filename, f, mime)},
                 timeout=30,
             )
         if up.status_code >= 400:
@@ -91,6 +107,7 @@ def _send_audio(phone_number_id: str, to: str, local_path: str) -> None:
         if not media_id:
             print(f"[audio] upload returned no id: {up.text[:300]}")
             return
+        print(f"[audio] uploaded media={media_id} mime={mime}")
     except Exception as e:
         print(f"[audio] upload error: {e}")
         return
@@ -114,6 +131,8 @@ def _send_audio(phone_number_id: str, to: str, local_path: str) -> None:
         )
         if r.status_code >= 400:
             print(f"[audio] send HTTP {r.status_code}: {r.text[:300]}")
+        else:
+            print(f"[audio] sent to {to} (rendered as {'voice note' if ext == '.ogg' else 'audio attachment'})")
     except Exception as e:
         print(f"[audio] send error: {e}")
     finally:
@@ -481,16 +500,38 @@ def _process_one_message(msg: dict, phone_number_id: str | None) -> None:
     # Optional voice reply: only when the user spoke AND the bot is configured
     # for sesli cavablar AND TTS is configured. Best-effort; never blocks text.
     try:
-        if (
+        should_voice = (
             message_type == "voice"
             and served_by
             and served_by.get("voice_reply_enabled")
-        ):
+        )
+        if not should_voice:
+            # Help user debug from Vercel logs why voice didn't fire
+            if message_type == "voice":
+                if not served_by:
+                    print("[voice-reply] skipped: no served_by bot (menu / no-bot path)")
+                elif not served_by.get("voice_reply_enabled"):
+                    print(
+                        f"[voice-reply] skipped: voice_reply_enabled is OFF "
+                        f"for bot {served_by.get('handle')!r}. "
+                        "Enable it in dashboard → İnteqrasiyalar → Sesli cavablar."
+                    )
+        else:
             import tts
-            if tts.is_configured():
-                audio_path = tts.synthesize(reply, served_by.get("voice_voice_id"))
+            if not tts.is_configured():
+                print(
+                    "[voice-reply] skipped: ELEVENLABS_API_KEY not set on this "
+                    "deployment. Add it in Vercel → sesly-bot → Settings → "
+                    "Environment Variables."
+                )
+            else:
+                voice_id = served_by.get("voice_voice_id")
+                print(f"[voice-reply] synthesizing with voice_id={voice_id or '<default>'}")
+                audio_path = tts.synthesize(reply, voice_id)
                 if audio_path:
                     _send_audio(phone_number_id, reply_to, audio_path)
+                else:
+                    print("[voice-reply] tts.synthesize returned None")
     except Exception as e:
         print(f"[voice-reply] best-effort failed: {e}")
 

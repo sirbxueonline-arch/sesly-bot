@@ -6,3 +6,8 @@ requests==2.32.3
 gunicorn==22.0.0
 supabase==2.9.1
 httpx==0.27.2
+# ffmpeg binary for converting ElevenLabs MP3 → OGG/Opus so WhatsApp
+# renders replies as actual voice notes (waveform UI) instead of audio
+# attachments. imageio-ffmpeg bundles a static ffmpeg binary inside the
+# Python package — no system install required.
+imageio-ffmpeg==0.5.1
