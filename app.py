@@ -111,7 +111,15 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
 
     bot = db.get_active_bot(customer_phone)
     if not bot:
-        return NO_BOT_MESSAGE
+        # Fallback: if there's a default "sesly" sales bot, route to it.
+        # This catches people who message the Sesly number directly without
+        # typing a /handle first (e.g. clicking the landing-page CTA).
+        bot = db.get_bot_by_handle("sesly")
+        if bot:
+            db.set_active_bot(customer_phone, bot["id"])
+            print(f"[router] no handle, no session → falling back to /sesly")
+        else:
+            return NO_BOT_MESSAGE
 
     # Plan limit check
     if db.is_over_message_limit(bot):
