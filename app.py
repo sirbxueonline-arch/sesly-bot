@@ -510,6 +510,65 @@ def voice_test():
     return jsonify(report), 200
 
 
+@app.route("/send-message", methods=["POST", "OPTIONS"])
+def send_message():
+    """
+    Send an arbitrary WhatsApp text from a bot to a customer.
+
+    Used by the dashboard when the owner marks a booking complete — the
+    bot then asks the customer for a 1-5 star rating.
+
+    Auth: shared X-Sesly-Preview-Token (same secret as /preview).
+
+    Body: {bot_id, customer_phone, message}
+    Returns: {ok: bool, error?: str}
+    """
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Sesly-Preview-Token"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        return resp
+
+    expected = os.getenv("SESLY_PREVIEW_TOKEN")
+    if not expected:
+        return jsonify({"ok": False, "error": "preview_token_not_configured"}), 503
+    if request.headers.get("X-Sesly-Preview-Token") != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    bot_id = (payload.get("bot_id") or "").strip()
+    customer_phone = (payload.get("customer_phone") or "").strip()
+    message = (payload.get("message") or "").strip()
+
+    if not customer_phone or not message:
+        return jsonify({"ok": False, "error": "customer_phone and message required"}), 400
+
+    # Meta wants digits only (no '+')
+    digits = "".join(c for c in customer_phone if c.isdigit())
+    if len(digits) < 8:
+        return jsonify({"ok": False, "error": "invalid_phone"}), 400
+
+    phone_number_id = os.getenv("META_PHONE_NUMBER_ID")
+    if not phone_number_id:
+        return jsonify({"ok": False, "error": "META_PHONE_NUMBER_ID not set"}), 503
+
+    try:
+        _send_text(phone_number_id, digits, message)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"send_error: {e}"}), 502
+
+    # Log into the conversation history so the bot remembers what it sent
+    if bot_id:
+        try:
+            store_phone = customer_phone if customer_phone.startswith("+") else f"+{customer_phone}"
+            db.save_message(bot_id, store_phone, "assistant", message)
+        except Exception as e:
+            print(f"[send-message] log save failed: {e}")
+
+    return jsonify({"ok": True})
+
+
 @app.route("/cron/digest", methods=["GET", "POST"])
 def cron_digest():
     """
