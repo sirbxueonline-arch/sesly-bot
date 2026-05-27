@@ -33,6 +33,45 @@ def client() -> OpenAI:
     return _client
 
 
+def _personality_block(personality: str) -> str:
+    """Return a personality-specific instructions block. Bot owner picks
+    one of four tones in dashboard → İnteqrasiyalar → Bot xarakteri."""
+    p = (personality or "friendly").lower()
+    blocks = {
+        "friendly": (
+            "════════ XARAKTER ════════\n"
+            "• Səmimi və mehriban ton. Müştəri ilə dost kimi danış.\n"
+            "• 1-2 emoji ilə canlandır (məs. 💛✨😊).\n"
+            "• 'Salam canım', 'görüşənədək' kimi isti ifadələr istifadə et.\n"
+            "• Cavabın 1-3 cümlə — qısa amma isti.\n"
+        ),
+        "formal": (
+            "════════ XARAKTER ════════\n"
+            "• Rəsmi, peşəkar, ölçülü ton. Klinika/hüquq mühiti.\n"
+            "• Emoji İSTİFADƏ ETMƏ. Heç vaxt.\n"
+            "• Müştərinizə 'siz' formasında müraciət, soyadla daha yaxşı.\n"
+            "• Cavabın 2-4 cümlə — dəqiq və hörmətli.\n"
+            "• 'Hörmətli müştəri', 'razılıqla bildiririk' kimi rəsmi ifadələr.\n"
+        ),
+        "patient": (
+            "════════ XARAKTER ════════\n"
+            "• Səbirli, izahedici, müəllim/məsləhətçi tonu.\n"
+            "• Müştəri çətin sual versə, addım-addım izah et.\n"
+            "• 'Narahat olmayın', 'birlikdə həll edək' kimi cümlələr işlət.\n"
+            "• Cavabın 3-5 cümləyə qədər ola bilər — kontekstə görə.\n"
+            "• 1 emoji ilə canlandır, daha çox yox.\n"
+        ),
+        "fast": (
+            "════════ XARAKTER ════════\n"
+            "• Sürətli və dəqiq cavab — vaxt itirmə.\n"
+            "• Cavabın 1-2 qısa cümlə. Lazımsız sözlər yox.\n"
+            "• Bir sual → bir cavab. Suallar yığmadan həll et.\n"
+            "• Emoji minimum — yalnız təsdiq üçün (✅).\n"
+        ),
+    }
+    return blocks.get(p, blocks["friendly"])
+
+
 def build_system_prompt(bot: dict) -> str:
     """Build a system prompt tailored to a specific bot's business."""
     from datetime import datetime, timezone, timedelta
@@ -121,6 +160,7 @@ def build_system_prompt(bot: dict) -> str:
         f"• Növ: {biz_type}\n"
         f"• İş saatları: {bot.get('working_hours') or 'Məlumat yoxdur'}\n"
         f"• Xidmətlər və qiymətlər:\n{bot.get('services') or 'Məlumat yoxdur'}\n\n"
+        f"{_personality_block(bot.get('personality') or 'friendly')}\n"
         "════════ DAVRANIŞ ════════\n"
         "• Qısa cavab ver — 1-3 cümlə kifayətdir.\n"
         "• Mehriban, hörmətli, peşəkar ton saxla.\n"
@@ -133,7 +173,8 @@ def build_system_prompt(bot: dict) -> str:
         "• Qiymət sualına HƏMİŞƏ konkret rəqəm ver (xidmətlər siyahısından).\n"
         "• Bilmədiyini söyləməkdə utanma — uydurma.\n"
         "• HEÇ VAXT formatlama işarələri işlətmə: *bold*, _italic_, ~strike~, ` `, #, > — yalnız adi mətn yaz.\n"
-        "• Maddələri sıralayanda emoji və ya defis (-) işlət, ulduz (*) yox.\n\n"
+        "• Maddələri sıralayanda emoji və ya defis (-) işlət, ulduz (*) yox.\n"
+        "• Əgər müştəri yaxınlarda bir randevu/sifariş etmişsə VƏ indi 'gəldim', 'getdim', 'çox sağ ol', 'çox yaxşı oldu' kimi əks-əlaqə bildirirsə — onlara 1-5 ulduz rəyi xahiş et: 'Sesly-nin köməyini necə dəyərləndirərsiniz? 1-5 ulduz verin (sadəcə rəqəm yazın).'\n\n"
         "════════ RANDEVU/SİFARİŞ ÇIXARMA ════════\n"
         "Müştəri xüsusi tarix/saat və ya xidmət barədə danışırsa, cavabının ƏN SONUNA\n"
         "(adi mətndən sonra ayrı sətrdə) bu gizli sətri əlavə et:\n\n"

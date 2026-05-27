@@ -445,6 +445,81 @@ def save_booking(
         _notify_owner_of_booking(bot_id, customer_phone, payload)
 
 
+def detect_and_save_review(
+    bot_id: str, customer_phone: str, message: str
+) -> Optional[int]:
+    """
+    If `message` looks like a 1-5 star rating, find this customer's most
+    recent confirmed booking with this bot in the last 14 days and save
+    a review row. Returns the rating (1-5) on success, None otherwise.
+    """
+    import re
+    from datetime import datetime, timezone, timedelta
+
+    if not message:
+        return None
+    # Accept "5", "5 ulduz", "5/5", "5 star", "⭐⭐⭐⭐⭐", but ONLY if the
+    # message is essentially just the rating (under 30 chars, contains a
+    # 1-5 digit at the start OR just stars).
+    text = message.strip()
+    if len(text) > 30:
+        return None
+
+    # Star count via emoji
+    star_count = text.count("⭐") + text.count("★")
+    if star_count >= 1 and star_count <= 5:
+        rating = star_count
+    else:
+        m = re.match(r"^([1-5])(?!\d)", text)
+        if not m:
+            return None
+        rating = int(m.group(1))
+
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+        recent = (
+            client()
+            .table("bookings")
+            .select("id, status, created_at")
+            .eq("bot_id", bot_id)
+            .eq("customer_phone", customer_phone)
+            .eq("status", "confirmed")
+            .gte("created_at", cutoff)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        booking_row = (recent.data or [None])[0]
+        booking_id = booking_row.get("id") if booking_row else None
+
+        # Skip duplicate review for the same booking
+        if booking_id:
+            existing = (
+                client()
+                .table("bot_reviews")
+                .select("id")
+                .eq("bot_id", bot_id)
+                .eq("customer_phone", customer_phone)
+                .eq("booking_id", booking_id)
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                return None
+
+        client().table("bot_reviews").insert({
+            "bot_id": bot_id,
+            "customer_phone": customer_phone,
+            "booking_id": booking_id,
+            "rating": rating,
+        }).execute()
+        print(f"[reviews] saved {rating}★ for bot={bot_id} customer={customer_phone}")
+        return rating
+    except Exception as e:
+        print(f"[reviews] save failed: {e}")
+        return None
+
+
 def _notify_owner_of_booking(bot_id: str, customer_phone: str, payload: dict) -> None:
     """Send a WhatsApp ping to the business owner that a booking landed,
     and (if Google Calendar is connected for this bot) insert a calendar event."""

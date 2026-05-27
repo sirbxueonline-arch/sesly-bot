@@ -243,6 +243,19 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
     if db.is_over_message_limit(bot):
         return LIMIT_REACHED_MESSAGE, bot
 
+    # Customer rating detection — if the message is just "1"-"5" (or stars),
+    # save as a review and reply with a thank-you instead of running AI.
+    rating = db.detect_and_save_review(bot["id"], customer_phone, message)
+    if rating:
+        thank_you = (
+            "Təşəkkür edirik 💛 Rəyiniz qeyd olundu — biznesə kömək edir."
+            if rating >= 4
+            else "Təşəkkür edirik rəyiniz üçün 🙏 Yaxşılaşdırmaq üçün çalışacağıq."
+        )
+        db.save_message(bot["id"], customer_phone, "user", message, message_type)
+        db.save_message(bot["id"], customer_phone, "assistant", thank_you)
+        return thank_you, bot
+
     away = _away_response(bot)
     if away:
         db.save_message(bot["id"], customer_phone, "user", message, message_type)
