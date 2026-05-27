@@ -1047,7 +1047,8 @@ def _process_telegram_update(update: dict) -> None:
 
 @app.route("/cron/hourly", methods=["GET", "POST"])
 def cron_hourly():
-    """Combined hourly cron — runs reminders + auto-complete in one call."""
+    """Combined hourly cron — runs reminders + auto-complete in one call.
+    Authenticated via CRON_SECRET (Vercel cron) or SESLY_CRON_TOKEN."""
     cron_secret = os.getenv("CRON_SECRET")
     fallback = os.getenv("SESLY_CRON_TOKEN")
     auth = request.headers.get("Authorization", "")
@@ -1060,17 +1061,146 @@ def cron_hourly():
     return jsonify({"ok": True, "reminders": rem, "auto_complete": ac})
 
 
+@app.route("/cron/admin/preview", methods=["GET"])
+def cron_admin_preview():
+    """Diagnostic: show current reminder window + bookings inside it,
+    WITHOUT sending anything. Public — no secrets returned, just booking
+    metadata the owner already sees in the dashboard."""
+    from datetime import datetime, timezone, timedelta
+    now_utc = datetime.now(timezone.utc)
+    window_start = now_utc + timedelta(minutes=60)
+    window_end = now_utc + timedelta(minutes=120)
+
+    out: dict = {
+        "now_utc": now_utc.isoformat(),
+        "now_baku": (now_utc + timedelta(hours=4)).isoformat(),
+        "reminder_window_minutes": "60-120",
+        "window_start_utc": window_start.isoformat(),
+        "window_end_utc": window_end.isoformat(),
+        "CRON_SECRET_set": bool(os.getenv("CRON_SECRET")),
+        "SESLY_CRON_TOKEN_set": bool(os.getenv("SESLY_CRON_TOKEN")),
+    }
+
+    try:
+        c = db.client()
+        result = (
+            c.table("bookings")
+            .select(
+                "id, bot_id, customer_phone, customer_name, service, "
+                "status, scheduled_at, scheduled_time_text, reminder_sent_at, "
+                "staff_name_at_booking, "
+                "bots(handle, display_name)"
+            )
+            .eq("status", "confirmed")
+            .gte("scheduled_at", window_start.isoformat())
+            .lt("scheduled_at", window_end.isoformat())
+            .execute()
+        )
+        rows = result.data or []
+        out["confirmed_bookings_in_window"] = len(rows)
+        out["already_reminded"] = sum(1 for b in rows if b.get("reminder_sent_at"))
+        out["would_send_now"] = sum(1 for b in rows if not b.get("reminder_sent_at"))
+        out["bookings"] = [
+            {
+                "id": b["id"],
+                "handle": (b.get("bots") or {}).get("handle"),
+                "customer_phone": b.get("customer_phone"),
+                "customer_name": b.get("customer_name"),
+                "service": b.get("service"),
+                "scheduled_at": b.get("scheduled_at"),
+                "scheduled_time_text": b.get("scheduled_time_text"),
+                "reminder_sent_at": b.get("reminder_sent_at"),
+                "minutes_until": int(
+                    (datetime.fromisoformat(
+                        (b["scheduled_at"] or "").replace("Z", "+00:00")
+                    ) - now_utc).total_seconds() / 60
+                ) if b.get("scheduled_at") else None,
+            }
+            for b in rows
+        ]
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+
+    # Also look at all confirmed bookings in the next 24 hours so the user
+    # can see what's queued up even outside the reminder window
+    try:
+        full = (
+            db.client().table("bookings")
+            .select(
+                "id, customer_phone, customer_name, service, scheduled_at, "
+                "scheduled_time_text, status, reminder_sent_at, "
+                "bots(handle)"
+            )
+            .eq("status", "confirmed")
+            .gte("scheduled_at", now_utc.isoformat())
+            .lt("scheduled_at", (now_utc + timedelta(hours=24)).isoformat())
+            .order("scheduled_at")
+            .execute()
+        )
+        out["next_24h_confirmed"] = [
+            {
+                "handle": (b.get("bots") or {}).get("handle"),
+                "scheduled_at": b.get("scheduled_at"),
+                "minutes_until": int(
+                    (datetime.fromisoformat(
+                        (b["scheduled_at"] or "").replace("Z", "+00:00")
+                    ) - now_utc).total_seconds() / 60
+                ),
+                "customer": b.get("customer_name") or b.get("customer_phone"),
+                "service": b.get("service"),
+                "reminder_sent_at": b.get("reminder_sent_at"),
+            }
+            for b in (full.data or [])
+        ]
+    except Exception as e:
+        out["next_24h_error"] = f"{e}"
+
+    return jsonify(out)
+
+
+@app.route("/cron/admin/trigger", methods=["GET", "POST"])
+def cron_admin_trigger():
+    """Manually run the reminder + auto-complete logic NOW, bypassing
+    the cron schedule. Useful for testing without waiting for Vercel
+    cron to fire.
+
+    Auth: SESLY_PREVIEW_TOKEN via X-Sesly-Preview-Token header OR ?token=
+    query param (so you can hit it from a browser).
+    """
+    expected = os.getenv("SESLY_PREVIEW_TOKEN")
+    if not expected:
+        return jsonify({"ok": False, "error": "SESLY_PREVIEW_TOKEN not set"}), 503
+    supplied = (
+        request.headers.get("X-Sesly-Preview-Token")
+        or request.args.get("token")
+    )
+    if supplied != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    rem = _run_reminders()
+    ac = _run_auto_complete()
+    return jsonify({"ok": True, "reminders": rem, "auto_complete": ac})
+
+
 def _run_reminders():
     """
-    Find confirmed bookings whose scheduled_at is 60-90 min away AND
-    we haven't sent a reminder yet — send a WhatsApp reminder.
+    Find confirmed bookings whose scheduled_at is 60-120 min away AND
+    we haven't sent a reminder yet — send a reminder via the right
+    channel (WhatsApp or Telegram).
+
+    Window is intentionally 60-MIN WIDE (60-120) to be cron-cycle-safe:
+    the hourly cron must catch every booking exactly once. With a 30-min
+    window (60-90), bookings scheduled in the wrong half of the hour
+    would slip through the gap between cron firings. Reminders may go
+    out up to 2h early in the worst case, which is acceptable.
+
     Idempotent via bookings.reminder_sent_at (migration 014).
     """
     try:
         from datetime import datetime, timezone, timedelta
         now_utc = datetime.now(timezone.utc)
         window_start = (now_utc + timedelta(minutes=60)).isoformat()
-        window_end = (now_utc + timedelta(minutes=90)).isoformat()
+        window_end = (now_utc + timedelta(minutes=120)).isoformat()
 
         c = db.client()
         # Find confirmed bookings whose scheduled_at falls in the 60-90 min
@@ -1117,9 +1247,26 @@ def _run_reminders():
         cust_name = b.get("customer_name") or ""
         name_part = f"{cust_name}, " if cust_name else ""
 
+        # Pick a time-relative phrase based on how far away the booking is.
+        # Window is 60-120 min so "1-2 saata" works as a safe phrasing,
+        # but if it's actually ~60 we say "təxminən 1 saata" for warmth.
+        minutes_left = None
+        try:
+            from datetime import datetime as _dt
+            dt = _dt.fromisoformat((b.get("scheduled_at") or "").replace("Z", "+00:00"))
+            minutes_left = int((dt - now_utc).total_seconds() / 60)
+        except Exception:
+            pass
+        if minutes_left is not None and minutes_left <= 75:
+            relative = "Təxminən 1 saata"
+        elif minutes_left is not None and minutes_left <= 105:
+            relative = "1.5 saata"
+        else:
+            relative = "Yaxınlarda"
+
         msg = (
             f"🔔 Salam {name_part}{biz_name}-dan xatırlatma.\n\n"
-            f"Bir saatdan sonra — {when} — {service}{staff_part} üçün gözləyirik.\n\n"
+            f"{relative} — saat {when} — {service}{staff_part} üçün gözləyirik.\n\n"
             f"Gələ bilməsəniz, sadəcə 'ləğv et' yazın."
         )
 
