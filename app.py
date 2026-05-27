@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 import db
 import ai
 import voice
+import telegram as tg
 from router import (
     MENU_MESSAGE,
     NO_BOT_MESSAGE,
@@ -570,7 +571,24 @@ def send_message():
     if not customer_phone or not message:
         return jsonify({"ok": False, "error": "customer_phone and message required"}), 400
 
-    # Meta wants digits only (no '+')
+    # Telegram path — bot_id is required to fetch the Telegram token
+    if tg.is_telegram_customer(customer_phone):
+        if not bot_id:
+            return jsonify({"ok": False, "error": "bot_id required for telegram send"}), 400
+        bot = db.get_bot_for_telegram(bot_id)
+        if not bot or not bot.get("telegram_bot_token"):
+            return jsonify({"ok": False, "error": "bot has no telegram token"}), 400
+        out = _send_to_customer(bot, customer_phone, message)
+        if not out.get("ok"):
+            return jsonify({"ok": False, "error": out.get("error")}), 502
+        # Log into history
+        try:
+            db.save_message(bot_id, customer_phone, "assistant", message)
+        except Exception as e:
+            print(f"[send-message] log save failed: {e}")
+        return jsonify({"ok": True, "channel": "telegram"})
+
+    # WhatsApp path (default)
     digits = "".join(c for c in customer_phone if c.isdigit())
     if len(digits) < 8:
         return jsonify({"ok": False, "error": "invalid_phone"}), 400
@@ -592,7 +610,285 @@ def send_message():
         except Exception as e:
             print(f"[send-message] log save failed: {e}")
 
+    return jsonify({"ok": True, "channel": "whatsapp"})
+
+
+# ---------------------------------------------------------------------------
+# Telegram bot integration
+# ---------------------------------------------------------------------------
+
+def _send_to_customer(bot: dict, customer_phone: str, text: str) -> dict:
+    """Route an outgoing message based on the customer_phone prefix.
+    - "tg:<chat_id>"  → Telegram (uses bot.telegram_bot_token)
+    - "+994..."       → WhatsApp (uses META_PHONE_NUMBER_ID)
+    Returns {ok: bool, error?: str, channel: 'telegram' | 'whatsapp'}.
+    """
+    if tg.is_telegram_customer(customer_phone):
+        chat_id = tg.customer_phone_to_chat_id(customer_phone)
+        token = (bot or {}).get("telegram_bot_token")
+        if not token or not chat_id:
+            return {"ok": False, "error": "missing telegram token or chat_id", "channel": "telegram"}
+        out = tg.send_message(token, chat_id, text)
+        out["channel"] = "telegram"
+        return out
+    # WhatsApp
+    digits = "".join(c for c in customer_phone if c.isdigit())
+    phone_number_id = os.getenv("META_PHONE_NUMBER_ID")
+    if not digits or not phone_number_id:
+        return {"ok": False, "error": "no whatsapp config or invalid phone", "channel": "whatsapp"}
+    try:
+        _send_text(phone_number_id, digits, text)
+        return {"ok": True, "channel": "whatsapp"}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "channel": "whatsapp"}
+
+
+@app.route("/telegram/setup", methods=["POST", "OPTIONS"])
+def telegram_setup():
+    """
+    Validate a Telegram bot token, register the webhook, and save the
+    Telegram bot username/id back to the bot row.
+
+    Auth: shared X-Sesly-Preview-Token.
+    Body: { bot_id, token, public_base_url? }
+    Returns: { ok, username?, error? }
+    """
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Sesly-Preview-Token"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        return resp
+
+    expected = os.getenv("SESLY_PREVIEW_TOKEN")
+    if not expected:
+        return jsonify({"ok": False, "error": "preview_token_not_configured"}), 503
+    if request.headers.get("X-Sesly-Preview-Token") != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    bot_id = (payload.get("bot_id") or "").strip()
+    token = (payload.get("token") or "").strip()
+    base_url = (
+        payload.get("public_base_url")
+        or os.getenv("PUBLIC_BASE_URL")
+        or "https://sesly-bot.vercel.app"
+    ).rstrip("/")
+
+    if not bot_id or not token:
+        return jsonify({"ok": False, "error": "bot_id and token required"}), 400
+
+    # Step 1: validate token + get username
+    me = tg.get_me(token)
+    if not me.get("ok"):
+        return jsonify({"ok": False, "error": f"invalid_token: {me.get('error')}"}), 200
+
+    username = me.get("username")
+    tg_id = str(me.get("id") or "")
+
+    # Step 2: register webhook
+    webhook_url = f"{base_url}/telegram/webhook/{bot_id}"
+    webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
+    set_result = tg.set_webhook(token, webhook_url, secret=webhook_secret)
+    if not set_result.get("ok"):
+        return jsonify({
+            "ok": False,
+            "error": f"webhook_failed: {set_result.get('error')}",
+            "username": username,
+        }), 200
+
+    # Step 3: persist
+    try:
+        db.update_bot_telegram(
+            bot_id,
+            token=token,
+            username=username,
+            telegram_id=tg_id,
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"db_update_failed: {e}"}), 500
+
+    return jsonify({
+        "ok": True,
+        "username": username,
+        "telegram_id": tg_id,
+        "webhook_url": webhook_url,
+    })
+
+
+@app.route("/telegram/disconnect", methods=["POST", "OPTIONS"])
+def telegram_disconnect():
+    """Remove the Telegram webhook and clear credentials on the bot row.
+
+    Auth: shared X-Sesly-Preview-Token.
+    Body: { bot_id }
+    """
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Sesly-Preview-Token"
+        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        return resp
+
+    expected = os.getenv("SESLY_PREVIEW_TOKEN")
+    if not expected:
+        return jsonify({"ok": False, "error": "preview_token_not_configured"}), 503
+    if request.headers.get("X-Sesly-Preview-Token") != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    bot_id = (payload.get("bot_id") or "").strip()
+    if not bot_id:
+        return jsonify({"ok": False, "error": "bot_id required"}), 400
+
+    bot = db.get_bot_for_telegram(bot_id)
+    if bot and bot.get("telegram_bot_token"):
+        try:
+            tg.delete_webhook(bot["telegram_bot_token"])
+        except Exception as e:
+            print(f"[telegram] delete_webhook failed: {e}")
+
+    db.update_bot_telegram(bot_id, token=None, username=None, telegram_id=None)
     return jsonify({"ok": True})
+
+
+@app.route("/telegram/webhook/<bot_id>", methods=["POST"])
+def telegram_webhook(bot_id: str):
+    """Receive an incoming Telegram update for a specific Sesly bot."""
+    # Optional shared-secret check (Telegram echoes back the secret_token we
+    # set during setWebhook in this header)
+    expected_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
+    if expected_secret:
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != expected_secret:
+            return jsonify({"ok": False, "error": "bad_secret"}), 401
+
+    update = request.get_json(silent=True) or {}
+
+    try:
+        _process_telegram_update(bot_id, update)
+    except Exception as e:
+        print(f"[telegram] webhook error: {e}")
+
+    # Always 200 quickly so Telegram doesn't retry
+    return jsonify({"ok": True}), 200
+
+
+def _process_telegram_update(bot_id: str, update: dict) -> None:
+    """Extract the message from a Telegram update and run it through the
+    standard _handle_message pipeline that WhatsApp uses."""
+    msg = update.get("message") or update.get("edited_message") or {}
+    if not msg:
+        return
+
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return
+
+    # Skip group / channel / supergroup chats for now — Sesly is 1:1 only
+    if chat.get("type") not in (None, "private"):
+        return
+
+    bot = db.get_bot_for_telegram(bot_id)
+    if not bot:
+        print(f"[telegram] no active bot for id={bot_id}")
+        return
+    if not bot.get("telegram_bot_token"):
+        print(f"[telegram] bot {bot_id} has no telegram_bot_token; ignoring update")
+        return
+
+    customer_phone = tg.chat_id_to_customer_phone(chat_id)
+    print(f"[tg-in] bot={bot_id} chat={chat_id}")
+
+    # Auto-prime active_bot mapping so subsequent messages without /handle
+    # still route to this bot. (WhatsApp does this inside _handle_message;
+    # Telegram users won't type "/handle" — they're already in this bot's
+    # DM channel, so we set the session up front.)
+    try:
+        db.set_active_bot(customer_phone, bot["id"])
+    except Exception as e:
+        print(f"[telegram] set_active_bot failed: {e}")
+
+    body: str | None = None
+    message_type = "text"
+
+    if "text" in msg:
+        body = (msg.get("text") or "").strip()
+
+        # Treat Telegram's /start as a "show menu" intent for new users —
+        # respond with the bot's greeting instead of running it through the
+        # /handle parser.
+        if body in ("/start", "/start@" + (bot.get("telegram_bot_username") or "")):
+            greeting = bot.get("greeting_message") or "Salam! 👋"
+            db.save_message(bot["id"], customer_phone, "user", body, "text")
+            db.save_message(bot["id"], customer_phone, "assistant", greeting)
+            tg.send_message(bot["telegram_bot_token"], chat_id, greeting)
+            return
+
+    elif "voice" in msg or "audio" in msg:
+        vfile = (msg.get("voice") or msg.get("audio") or {})
+        file_id = vfile.get("file_id")
+        if not file_id:
+            tg.send_message(bot["telegram_bot_token"], chat_id, "Sesli mesajı oxuya bilmədim.")
+            return
+        transcript = tg.transcribe_voice(bot["telegram_bot_token"], file_id)
+        if not transcript:
+            tg.send_message(
+                bot["telegram_bot_token"], chat_id,
+                "Sesli mesajınızı anlaya bilmədim, zəhmət olmasa yenidən cəhd edin və ya yazılı göndərin."
+            )
+            return
+        print(f"[tg-voice] transcript: {transcript!r}")
+        body = transcript
+        message_type = "voice"
+
+    elif "photo" in msg or "document" in msg or "video" in msg or "sticker" in msg:
+        tg.send_message(
+            bot["telegram_bot_token"], chat_id,
+            "Hələlik yalnız yazılı və sesli mesajları qəbul edirəm."
+        )
+        return
+
+    else:
+        tg.send_message(
+            bot["telegram_bot_token"], chat_id,
+            "Hələlik yalnız yazılı və sesli mesajları qəbul edirəm."
+        )
+        return
+
+    if not body:
+        tg.send_message(bot["telegram_bot_token"], chat_id, "Boş mesaj qəbul edildi. Zəhmət olmasa mətn yazın.")
+        return
+
+    reply, served_by = _handle_message(customer_phone, body, message_type=message_type)
+
+    # Voice replies on Telegram follow the same kill switch / per-bot toggle
+    voice_replies_disabled = os.getenv("VOICE_REPLIES_DISABLED", "").lower() in ("1", "true", "yes")
+    should_voice = (
+        not voice_replies_disabled
+        and message_type == "voice"
+        and served_by
+        and served_by.get("voice_reply_enabled")
+    )
+
+    voice_sent = False
+    if should_voice:
+        try:
+            import tts
+            if tts.is_configured():
+                voice_id = served_by.get("voice_voice_id")
+                audio_path = tts.synthesize(reply, voice_id)
+                if audio_path:
+                    send_result = tg.send_voice(bot["telegram_bot_token"], chat_id, audio_path)
+                    if send_result.get("ok"):
+                        voice_sent = True
+                    else:
+                        print(f"[tg-voice-reply] failed: {send_result.get('error')}")
+        except Exception as e:
+            print(f"[tg-voice-reply] exception: {e}")
+
+    if not voice_sent:
+        tg.send_message(bot["telegram_bot_token"], chat_id, reply)
 
 
 @app.route("/cron/hourly", methods=["GET", "POST"])
@@ -673,7 +969,29 @@ def _run_reminders():
             f"Gələ bilməsəniz, sadəcə 'ləğv et' yazın."
         )
 
-        # Send via Meta directly
+        # Route by channel — Telegram or WhatsApp
+        if tg.is_telegram_customer(cust_phone):
+            bot_full = db.get_bot_for_telegram(b["bot_id"])
+            if not bot_full or not bot_full.get("telegram_bot_token"):
+                skipped += 1
+                continue
+            try:
+                out = _send_to_customer(bot_full, cust_phone, msg)
+                if not out.get("ok"):
+                    skipped += 1
+                    print(f"[reminder] telegram send failed for {b['id']}: {out.get('error')}")
+                    continue
+                db.client().table("bookings").update({
+                    "reminder_sent_at": datetime.now(timezone.utc).isoformat()
+                }).eq("id", b["id"]).execute()
+                sent += 1
+                print(f"[reminder] sent (tg) for booking={b['id']}")
+            except Exception as e:
+                print(f"[reminder] tg failed for {b['id']}: {e}")
+                skipped += 1
+            continue
+
+        # WhatsApp via Meta directly
         digits = "".join(ch for ch in cust_phone if ch.isdigit())
         phone_number_id = os.getenv("META_PHONE_NUMBER_ID")
         if not digits or not phone_number_id:
@@ -751,12 +1069,8 @@ def _run_auto_complete():
             skipped += 1
             continue
 
-        # Send review request via WhatsApp
+        # Send review request via the right channel
         cust_phone = b.get("customer_phone") or ""
-        digits = "".join(ch for ch in cust_phone if ch.isdigit())
-        phone_number_id = os.getenv("META_PHONE_NUMBER_ID")
-        if not digits or not phone_number_id:
-            continue
         bot_row = b.get("bots") or {}
         biz_name = bot_row.get("display_name") or "Sesly"
         cust_name = (b.get("customer_name") or "").strip() or "müştəri"
@@ -767,6 +1081,24 @@ def _run_auto_complete():
             f"Rəyiniz bizə daha yaxşı xidmət vermək üçün kömək edir."
             + (f"\n\n(Xidmət: {service})" if service else "")
         )
+
+        if tg.is_telegram_customer(cust_phone):
+            bot_full = db.get_bot_for_telegram(b["bot_id"])
+            if not bot_full or not bot_full.get("telegram_bot_token"):
+                continue
+            try:
+                out = _send_to_customer(bot_full, cust_phone, msg)
+                if out.get("ok"):
+                    review_sent += 1
+            except Exception as e:
+                print(f"[auto-complete] tg review send failed: {e}")
+            continue
+
+        # WhatsApp path
+        digits = "".join(ch for ch in cust_phone if ch.isdigit())
+        phone_number_id = os.getenv("META_PHONE_NUMBER_ID")
+        if not digits or not phone_number_id:
+            continue
         try:
             _send_text(phone_number_id, digits, msg)
             review_sent += 1
