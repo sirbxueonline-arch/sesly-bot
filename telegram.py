@@ -97,22 +97,34 @@ def delete_webhook(token: str) -> dict:
 # Sending
 # ---------------------------------------------------------------------------
 
-def send_message(token: str, chat_id: str | int, text: str) -> dict:
-    """Send a text message. Chunks if > 4096 chars (Telegram limit)."""
+def send_message(
+    token: str,
+    chat_id: str | int,
+    text: str,
+    reply_markup: Optional[dict] = None,
+) -> dict:
+    """Send a text message. Chunks if > 4096 chars (Telegram limit).
+
+    Optional reply_markup attaches an inline keyboard, reply keyboard, or
+    request_contact button. Only the LAST chunk gets the markup so the
+    keyboard appears once at the end of the conversation."""
     if not token or not chat_id:
         return {"ok": False, "error": "missing token or chat_id"}
-    # Telegram supports up to 4096 chars per message
     chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [""]
     last = {"ok": True}
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
+        payload = {
+            "chat_id": chat_id,
+            "text": chunk,
+            "disable_web_page_preview": True,
+        }
+        # Attach the keyboard only to the LAST chunk
+        if reply_markup and i == len(chunks) - 1:
+            payload["reply_markup"] = reply_markup
         try:
             r = requests.post(
                 _api(token, "sendMessage"),
-                json={
-                    "chat_id": chat_id,
-                    "text": chunk,
-                    "disable_web_page_preview": True,
-                },
+                json=payload,
                 timeout=15,
             )
             data = r.json()
@@ -122,6 +134,31 @@ def send_message(token: str, chat_id: str | int, text: str) -> dict:
         except Exception as e:
             return {"ok": False, "error": f"exception: {e}"}
     return last
+
+
+# ---------------------------------------------------------------------------
+# Keyboard helpers
+# ---------------------------------------------------------------------------
+
+def contact_request_keyboard(
+    button_text: str = "📞 Telefon nömrəmi paylaş",
+) -> dict:
+    """Build a one-time reply keyboard that contains a single button which,
+    when tapped, asks the customer to share their phone number. Telegram
+    handles the consent dialog. After they tap (or send another message),
+    the keyboard disappears."""
+    return {
+        "keyboard": [[{"text": button_text, "request_contact": True}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+        "input_field_placeholder": "Nömrəmi paylaşmaq üçün düyməyə bas",
+    }
+
+
+def remove_keyboard() -> dict:
+    """Clear any custom reply keyboard so the customer's normal keyboard
+    comes back."""
+    return {"remove_keyboard": True}
 
 
 def send_voice(token: str, chat_id: str | int, local_path: str) -> dict:

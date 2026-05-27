@@ -896,6 +896,46 @@ def _process_telegram_update(update: dict) -> None:
     body: str | None = None
     message_type = "text"
     bot_username = _telegram_bot_username()
+    # Track whether this update is a /start so we can offer the contact
+    # share button AFTER the bot's greeting.
+    is_start_command = False
+
+    # --- Contact share message ----------------------------------------------
+    # When the customer taps the "Share phone" button, Telegram sends a
+    # message with a `contact` field. We save it, acknowledge, and stop
+    # before running the AI pipeline (this isn't a chat message).
+    if "contact" in msg:
+        contact = msg.get("contact") or {}
+        from_user = msg.get("from") or {}
+        # Only accept the contact if it's the SAME user sharing their OWN
+        # number (Telegram lets you forward someone else's contact too,
+        # which we don't want as the customer's identity).
+        if contact.get("user_id") and contact.get("user_id") == from_user.get("id"):
+            phone = (contact.get("phone_number") or "").strip()
+            # Telegram returns the phone without a leading "+" — add it for
+            # consistency with the WhatsApp E.164 format.
+            if phone and not phone.startswith("+"):
+                phone = "+" + phone
+            db.save_telegram_contact(
+                chat_id,
+                phone=phone or None,
+                first_name=contact.get("first_name") or from_user.get("first_name"),
+                last_name=contact.get("last_name") or from_user.get("last_name"),
+                username=from_user.get("username"),
+                language_code=from_user.get("language_code"),
+            )
+            tg.send_message(
+                token, chat_id,
+                f"Təşəkkürlər! Nömrəniz qeyd olundu ({phone}). İndi sualınızı yazın.",
+                reply_markup=tg.remove_keyboard(),
+            )
+        else:
+            tg.send_message(
+                token, chat_id,
+                "Yalnız öz nömrənizi paylaşa bilərsiniz. 🙂",
+                reply_markup=tg.remove_keyboard(),
+            )
+        return
 
     if "text" in msg:
         body = (msg.get("text") or "").strip()
@@ -903,15 +943,16 @@ def _process_telegram_update(update: dict) -> None:
         # Normalize Telegram-specific commands into WhatsApp-style /handle
         # so _handle_message can route them.
         if body == "/start" or (bot_username and body == f"/start@{bot_username}"):
-            # Bare /start — let _handle_message fall through to /sesly
-            # (same as a brand-new WhatsApp customer texting the number)
+            is_start_command = True
             body = ""
         elif body.startswith("/start "):
             # Deep link: /start <payload> → /<payload>
+            is_start_command = True
             payload = body[7:].strip().split()[0] if body[7:].strip() else ""
             body = f"/{payload}" if payload else ""
         elif body.startswith("/start@") and " " in body:
             # /start@seslyaibot aysel_salon — same deep link, group-style
+            is_start_command = True
             tail = body.split(" ", 1)[1].strip().split()[0]
             body = f"/{tail}" if tail else ""
 
@@ -982,6 +1023,26 @@ def _process_telegram_update(update: dict) -> None:
 
     if not voice_sent:
         tg.send_message(token, chat_id, reply)
+
+    # After the bot's /start greeting, prompt the customer to share their
+    # phone — but only if we don't already have it. The dashboard joins on
+    # telegram_contacts to show real phone numbers next to Telegram
+    # conversations instead of useless masked chat_ids.
+    if is_start_command:
+        try:
+            if not db.has_telegram_contact(chat_id):
+                tg.send_message(
+                    token,
+                    chat_id,
+                    (
+                        "📞 Müştəri xidmətimiz üçün telefon nömrənizi "
+                        "paylaşa bilərsiniz — biznes lazım olduqda sizinlə "
+                        "əlaqə saxlamaq üçün istifadə edəcək."
+                    ),
+                    reply_markup=tg.contact_request_keyboard(),
+                )
+        except Exception as e:
+            print(f"[tg-contact] prompt failed: {e}")
 
 
 @app.route("/cron/hourly", methods=["GET", "POST"])

@@ -69,6 +69,70 @@ def get_bot_by_handle(handle: str) -> Optional[dict]:
     return None
 
 
+def get_telegram_contact(chat_id: str | int) -> Optional[dict]:
+    """Return the saved contact record for a Telegram chat_id, or None.
+    chat_id is the bare digits (no 'tg:' prefix)."""
+    if chat_id is None:
+        return None
+    try:
+        r = (
+            client()
+            .table("telegram_contacts")
+            .select("*")
+            .eq("chat_id", str(chat_id))
+            .maybe_single()
+            .execute()
+        )
+        return r.data if r else None
+    except Exception as e:
+        print(f"[db] get_telegram_contact failed: {e}")
+        return None
+
+
+def has_telegram_contact(chat_id: str | int) -> bool:
+    """Cheap check: do we already have a phone for this chat_id?"""
+    row = get_telegram_contact(chat_id)
+    return bool(row and row.get("phone"))
+
+
+def save_telegram_contact(
+    chat_id: str | int,
+    *,
+    phone: Optional[str],
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    username: Optional[str] = None,
+    language_code: Optional[str] = None,
+) -> None:
+    """Upsert a Telegram contact row. Called when a customer taps the
+    request_contact button and Telegram sends us their phone."""
+    if not chat_id:
+        return
+    payload = {
+        "chat_id": str(chat_id),
+        "phone": phone,
+        "first_name": first_name,
+        "last_name": last_name,
+        "username": username,
+        "language_code": language_code,
+        "updated_at": _utcnow_iso(),
+    }
+    # Drop Nones so we don't overwrite existing values with NULL on later
+    # interactions (e.g. when we only have updated profile but not phone)
+    payload = {k: v for k, v in payload.items() if v is not None}
+    try:
+        client().table("telegram_contacts").upsert(
+            payload, on_conflict="chat_id"
+        ).execute()
+    except Exception as e:
+        print(f"[db] save_telegram_contact failed: {e}")
+
+
+def _utcnow_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
 def telegram_update_seen(update_id: int) -> bool:
     """Idempotency guard. Returns True if this Telegram update_id has
     already been processed (caller should skip), False if new (caller
