@@ -571,21 +571,17 @@ def send_message():
     if not customer_phone or not message:
         return jsonify({"ok": False, "error": "customer_phone and message required"}), 400
 
-    # Telegram path — bot_id is required to fetch the Telegram token
+    # Telegram path — uses TELEGRAM_BOT_TOKEN env var (single master bot)
     if tg.is_telegram_customer(customer_phone):
-        if not bot_id:
-            return jsonify({"ok": False, "error": "bot_id required for telegram send"}), 400
-        bot = db.get_bot_for_telegram(bot_id)
-        if not bot or not bot.get("telegram_bot_token"):
-            return jsonify({"ok": False, "error": "bot has no telegram token"}), 400
-        out = _send_to_customer(bot, customer_phone, message)
+        out = _send_to_customer({}, customer_phone, message)
         if not out.get("ok"):
             return jsonify({"ok": False, "error": out.get("error")}), 502
-        # Log into history
-        try:
-            db.save_message(bot_id, customer_phone, "assistant", message)
-        except Exception as e:
-            print(f"[send-message] log save failed: {e}")
+        # Log into history if we know which bot owns this conversation
+        if bot_id:
+            try:
+                db.save_message(bot_id, customer_phone, "assistant", message)
+            except Exception as e:
+                print(f"[send-message] log save failed: {e}")
         return jsonify({"ok": True, "channel": "telegram"})
 
     # WhatsApp path (default)
@@ -614,34 +610,52 @@ def send_message():
 
 
 # ---------------------------------------------------------------------------
-# Telegram bot integration
+# Telegram bot integration (single master bot, env-configured — same shape
+# as the WhatsApp setup. ONE token in TELEGRAM_BOT_TOKEN env var, ONE
+# webhook, customers type /handle to switch between businesses.)
 # ---------------------------------------------------------------------------
+
+def _telegram_token() -> str | None:
+    return os.getenv("TELEGRAM_BOT_TOKEN")
+
+
+def _telegram_bot_username() -> str:
+    """Cached username of the master bot. Falls back to env var override,
+    otherwise looks it up via getMe (cheap, one-time)."""
+    cached = getattr(_telegram_bot_username, "_cached", None)
+    if cached:
+        return cached
+    override = os.getenv("TELEGRAM_BOT_USERNAME")
+    if override:
+        _telegram_bot_username._cached = override
+        return override
+    token = _telegram_token()
+    if not token:
+        return ""
+    me = tg.get_me(token)
+    if me.get("ok") and me.get("username"):
+        _telegram_bot_username._cached = me["username"]
+        return me["username"]
+    return ""
+
 
 def _send_to_customer(bot: dict, customer_phone: str, text: str) -> dict:
     """Route an outgoing message based on the customer_phone prefix.
 
-    - "tg:<chat_id>"  → Telegram. Uses bot.telegram_bot_token if present,
-                        otherwise falls back to the business's Telegram
-                        router (the bot in this business that owns the
-                        Telegram setup). This lets reminders / review
-                        prompts for sub-bots like /aysel_salon go out via
-                        the single @seslyaibot entry point.
+    - "tg:<chat_id>"  → Telegram (uses TELEGRAM_BOT_TOKEN env var — single
+                         master bot for the whole platform, same shape as
+                         the META_PHONE_NUMBER_ID setup for WhatsApp)
     - "+994..."       → WhatsApp (uses META_PHONE_NUMBER_ID)
     Returns {ok: bool, error?: str, channel: 'telegram' | 'whatsapp'}.
+    The `bot` arg is kept for signature parity; not used for Telegram.
     """
     if tg.is_telegram_customer(customer_phone):
         chat_id = tg.customer_phone_to_chat_id(customer_phone)
-        token = (bot or {}).get("telegram_bot_token")
-        # Cascade to business router when this specific bot has no Telegram
-        # token of its own (the typical case for sub-bots).
-        if not token and bot and bot.get("business_id"):
-            router = db.get_telegram_router_for_business(bot["business_id"])
-            if router:
-                token = router.get("telegram_bot_token")
+        token = _telegram_token()
         if not token or not chat_id:
             return {
                 "ok": False,
-                "error": "no telegram router for this business",
+                "error": "TELEGRAM_BOT_TOKEN not set",
                 "channel": "telegram",
             }
         out = tg.send_message(token, chat_id, text)
@@ -659,15 +673,15 @@ def _send_to_customer(bot: dict, customer_phone: str, text: str) -> dict:
         return {"ok": False, "error": str(e), "channel": "whatsapp"}
 
 
-@app.route("/telegram/setup", methods=["POST", "OPTIONS"])
-def telegram_setup():
-    """
-    Validate a Telegram bot token, register the webhook, and save the
-    Telegram bot username/id back to the bot row.
+@app.route("/telegram/admin/register-webhook", methods=["POST", "OPTIONS"])
+def telegram_admin_register_webhook():
+    """One-time webhook registration (admin-only). Call this once after
+    setting TELEGRAM_BOT_TOKEN in Vercel env vars to point Telegram at our
+    /telegram/webhook endpoint.
 
     Auth: shared X-Sesly-Preview-Token.
-    Body: { bot_id, token, public_base_url? }
-    Returns: { ok, username?, error? }
+    Body: { public_base_url? }  (defaults to PUBLIC_BASE_URL env or sesly-bot.vercel.app)
+    Returns: { ok, webhook_url, username, error? }
     """
     if request.method == "OPTIONS":
         resp = jsonify({})
@@ -682,97 +696,54 @@ def telegram_setup():
     if request.headers.get("X-Sesly-Preview-Token") != expected:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
+    token = _telegram_token()
+    if not token:
+        return jsonify({
+            "ok": False,
+            "error": "TELEGRAM_BOT_TOKEN env var not set on sesly-bot",
+        }), 503
+
     payload = request.get_json(silent=True) or {}
-    bot_id = (payload.get("bot_id") or "").strip()
-    token = (payload.get("token") or "").strip()
     base_url = (
         payload.get("public_base_url")
         or os.getenv("PUBLIC_BASE_URL")
         or "https://sesly-bot.vercel.app"
     ).rstrip("/")
+    webhook_url = f"{base_url}/telegram/webhook"
+    webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
-    if not bot_id or not token:
-        return jsonify({"ok": False, "error": "bot_id and token required"}), 400
-
-    # Step 1: validate token + get username
+    # Validate the token by calling getMe — this also gives us the username
     me = tg.get_me(token)
     if not me.get("ok"):
-        return jsonify({"ok": False, "error": f"invalid_token: {me.get('error')}"}), 200
+        return jsonify({
+            "ok": False,
+            "error": f"invalid_token: {me.get('error')}",
+        }), 400
 
-    username = me.get("username")
-    tg_id = str(me.get("id") or "")
-
-    # Step 2: register webhook
-    webhook_url = f"{base_url}/telegram/webhook/{bot_id}"
-    webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
     set_result = tg.set_webhook(token, webhook_url, secret=webhook_secret)
     if not set_result.get("ok"):
         return jsonify({
             "ok": False,
             "error": f"webhook_failed: {set_result.get('error')}",
-            "username": username,
-        }), 200
+        }), 502
 
-    # Step 3: persist
-    try:
-        db.update_bot_telegram(
-            bot_id,
-            token=token,
-            username=username,
-            telegram_id=tg_id,
-        )
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"db_update_failed: {e}"}), 500
+    # Cache the username so we don't have to re-fetch on every webhook
+    _telegram_bot_username._cached = me.get("username")
 
     return jsonify({
         "ok": True,
-        "username": username,
-        "telegram_id": tg_id,
         "webhook_url": webhook_url,
+        "username": me.get("username"),
+        "telegram_id": me.get("id"),
     })
 
 
-@app.route("/telegram/disconnect", methods=["POST", "OPTIONS"])
-def telegram_disconnect():
-    """Remove the Telegram webhook and clear credentials on the bot row.
-
-    Auth: shared X-Sesly-Preview-Token.
-    Body: { bot_id }
-    """
-    if request.method == "OPTIONS":
-        resp = jsonify({})
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Sesly-Preview-Token"
-        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
-        return resp
-
-    expected = os.getenv("SESLY_PREVIEW_TOKEN")
-    if not expected:
-        return jsonify({"ok": False, "error": "preview_token_not_configured"}), 503
-    if request.headers.get("X-Sesly-Preview-Token") != expected:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-
-    payload = request.get_json(silent=True) or {}
-    bot_id = (payload.get("bot_id") or "").strip()
-    if not bot_id:
-        return jsonify({"ok": False, "error": "bot_id required"}), 400
-
-    bot = db.get_bot_for_telegram(bot_id)
-    if bot and bot.get("telegram_bot_token"):
-        try:
-            tg.delete_webhook(bot["telegram_bot_token"])
-        except Exception as e:
-            print(f"[telegram] delete_webhook failed: {e}")
-
-    db.update_bot_telegram(bot_id, token=None, username=None, telegram_id=None)
-    return jsonify({"ok": True})
-
-
-@app.route("/telegram/webhook/<bot_id>", methods=["POST"])
-def telegram_webhook(bot_id: str):
-    """Receive an incoming Telegram update for a specific Sesly bot."""
-    # Optional shared-secret check (Telegram echoes back the secret_token we
-    # set during setWebhook in this header)
+@app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    """Receive an incoming Telegram update on the master bot (single
+    webhook, env-configured — same shape as /whatsapp)."""
+    # Optional shared-secret check (Telegram echoes back our secret_token
+    # in this header on every update)
     expected_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET")
     if expected_secret:
         if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != expected_secret:
@@ -781,7 +752,7 @@ def telegram_webhook(bot_id: str):
     update = request.get_json(silent=True) or {}
 
     try:
-        _process_telegram_update(bot_id, update)
+        _process_telegram_update(update)
     except Exception as e:
         print(f"[telegram] webhook error: {e}")
 
@@ -789,25 +760,22 @@ def telegram_webhook(bot_id: str):
     return jsonify({"ok": True}), 200
 
 
-def _process_telegram_update(bot_id: str, update: dict) -> None:
-    """Extract the message from a Telegram update and run it through the
-    same _handle_message pipeline that WhatsApp uses.
+def _process_telegram_update(update: dict) -> None:
+    """Run a Telegram update through the same _handle_message pipeline that
+    WhatsApp uses. Single master bot — customers /handle to switch.
 
-    Routing model — same shape as WhatsApp:
-      - "/start"                       → routed to the entry bot's handle
-                                         (e.g. "/sesly"), greets the customer
-                                         with the entry bot.
+    Routing model (mirrors WhatsApp exactly):
+      - "/start"                       → falls through to /sesly (master
+                                         sales bot) via _handle_message's
+                                         built-in fallback.
       - "/start <handle>" (deep link)  → routed to "/<handle>" so links like
                                          t.me/seslyaibot?start=aysel_salon
                                          drop customers directly into Aysel.
-      - "/<handle>"                    → switches active bot (same as WhatsApp)
-      - "/menu"                        → shows the menu (same as WhatsApp)
+      - "/<handle>"                    → switches active bot
+      - "/menu"                        → shows the menu
       - plain text / voice             → continues with the active bot, or
-                                         falls through to /sesly if none.
-
-    Replies are always sent via the Telegram entry bot's token (the one
-    that owns the webhook), regardless of which bot is currently serving
-    the customer."""
+                                         /sesly fallback for new customers
+    """
     msg = update.get("message") or update.get("edited_message") or {}
     if not msg:
         return
@@ -821,51 +789,46 @@ def _process_telegram_update(bot_id: str, update: dict) -> None:
     if chat.get("type") not in (None, "private"):
         return
 
-    entry_bot = db.get_bot_for_telegram(bot_id)
-    if not entry_bot:
-        print(f"[telegram] no active bot for id={bot_id}")
-        return
-    if not entry_bot.get("telegram_bot_token"):
-        print(f"[telegram] bot {bot_id} has no telegram_bot_token; ignoring")
+    token = _telegram_token()
+    if not token:
+        print("[telegram] TELEGRAM_BOT_TOKEN not set; dropping update")
         return
 
     customer_phone = tg.chat_id_to_customer_phone(chat_id)
-    entry_token = entry_bot["telegram_bot_token"]
-    entry_username = entry_bot.get("telegram_bot_username") or ""
-    entry_handle = entry_bot.get("handle") or "sesly"
-    print(f"[tg-in] entry={entry_handle} chat={chat_id}")
+    print(f"[tg-in] chat={chat_id}")
 
     body: str | None = None
     message_type = "text"
+    bot_username = _telegram_bot_username()
 
     if "text" in msg:
         body = (msg.get("text") or "").strip()
 
         # Normalize Telegram-specific commands into WhatsApp-style /handle
-        # so _handle_message can route them. Without this, "/start" would
-        # be parsed as the literal handle "start" and 404.
-        if body == "/start" or body == f"/start@{entry_username}":
-            # Bare /start → enter the entry bot's handle
-            body = f"/{entry_handle}"
+        # so _handle_message can route them.
+        if body == "/start" or (bot_username and body == f"/start@{bot_username}"):
+            # Bare /start — let _handle_message fall through to /sesly
+            # (same as a brand-new WhatsApp customer texting the number)
+            body = ""
         elif body.startswith("/start "):
             # Deep link: /start <payload> → /<payload>
             payload = body[7:].strip().split()[0] if body[7:].strip() else ""
-            body = f"/{payload}" if payload else f"/{entry_handle}"
+            body = f"/{payload}" if payload else ""
         elif body.startswith("/start@") and " " in body:
             # /start@seslyaibot aysel_salon — same deep link, group-style
-            tail = body.split(" ", 1)[1].strip().split()[0] if " " in body else ""
-            body = f"/{tail}" if tail else f"/{entry_handle}"
+            tail = body.split(" ", 1)[1].strip().split()[0]
+            body = f"/{tail}" if tail else ""
 
     elif "voice" in msg or "audio" in msg:
         vfile = (msg.get("voice") or msg.get("audio") or {})
         file_id = vfile.get("file_id")
         if not file_id:
-            tg.send_message(entry_token, chat_id, "Sesli mesajı oxuya bilmədim.")
+            tg.send_message(token, chat_id, "Sesli mesajı oxuya bilmədim.")
             return
-        transcript = tg.transcribe_voice(entry_token, file_id)
+        transcript = tg.transcribe_voice(token, file_id)
         if not transcript:
             tg.send_message(
-                entry_token, chat_id,
+                token, chat_id,
                 "Sesli mesajınızı anlaya bilmədim, zəhmət olmasa yenidən cəhd edin və ya yazılı göndərin."
             )
             return
@@ -875,32 +838,24 @@ def _process_telegram_update(bot_id: str, update: dict) -> None:
 
     elif "photo" in msg or "document" in msg or "video" in msg or "sticker" in msg:
         tg.send_message(
-            entry_token, chat_id,
+            token, chat_id,
             "Hələlik yalnız yazılı və sesli mesajları qəbul edirəm."
         )
         return
 
     else:
         tg.send_message(
-            entry_token, chat_id,
+            token, chat_id,
             "Hələlik yalnız yazılı və sesli mesajları qəbul edirəm."
         )
         return
 
-    if not body:
-        tg.send_message(entry_token, chat_id, "Boş mesaj qəbul edildi. Zəhmət olmasa mətn yazın.")
+    # Empty body (bare /start after normalization) → run through
+    # _handle_message with an empty string. The router will fall through to
+    # /sesly via its built-in fallback, exactly like a new WhatsApp number
+    # texting in cold.
+    if body is None:
         return
-
-    # If this customer has no active bot yet (first message that isn't a
-    # /handle / /start), pin them to the Telegram entry bot so they don't
-    # accidentally fall through to /sesly in a different business.
-    if not body.startswith("/"):
-        try:
-            existing = db.get_active_bot(customer_phone)
-            if not existing:
-                db.set_active_bot(customer_phone, entry_bot["id"])
-        except Exception as e:
-            print(f"[telegram] active-bot prime failed: {e}")
 
     reply, served_by = _handle_message(customer_phone, body, message_type=message_type)
 
@@ -921,7 +876,7 @@ def _process_telegram_update(bot_id: str, update: dict) -> None:
                 voice_id = served_by.get("voice_voice_id")
                 audio_path = tts.synthesize(reply, voice_id)
                 if audio_path:
-                    send_result = tg.send_voice(entry_token, chat_id, audio_path)
+                    send_result = tg.send_voice(token, chat_id, audio_path)
                     if send_result.get("ok"):
                         voice_sent = True
                     else:
@@ -930,7 +885,7 @@ def _process_telegram_update(bot_id: str, update: dict) -> None:
             print(f"[tg-voice-reply] exception: {e}")
 
     if not voice_sent:
-        tg.send_message(entry_token, chat_id, reply)
+        tg.send_message(token, chat_id, reply)
 
 
 @app.route("/cron/hourly", methods=["GET", "POST"])
@@ -1011,17 +966,12 @@ def _run_reminders():
             f"Gələ bilməsəniz, sadəcə 'ləğv et' yazın."
         )
 
-        # Route by channel — Telegram or WhatsApp
+        # Route by channel — Telegram or WhatsApp. For Telegram, the master
+        # token is read from env (TELEGRAM_BOT_TOKEN) by _send_to_customer,
+        # so we just call it directly.
         if tg.is_telegram_customer(cust_phone):
-            # _send_to_customer cascades to the business's Telegram router
-            # when this specific bot doesn't have its own token, so /aysel_salon
-            # sub-bot reminders still flow out via @seslyaibot.
-            bot_full = db.get_bot_for_telegram(b["bot_id"])
-            if not bot_full:
-                skipped += 1
-                continue
             try:
-                out = _send_to_customer(bot_full, cust_phone, msg)
+                out = _send_to_customer({}, cust_phone, msg)
                 if not out.get("ok"):
                     skipped += 1
                     print(f"[reminder] telegram send failed for {b['id']}: {out.get('error')}")
@@ -1128,12 +1078,8 @@ def _run_auto_complete():
         )
 
         if tg.is_telegram_customer(cust_phone):
-            # _send_to_customer cascades to the business's Telegram router.
-            bot_full = db.get_bot_for_telegram(b["bot_id"])
-            if not bot_full:
-                continue
             try:
-                out = _send_to_customer(bot_full, cust_phone, msg)
+                out = _send_to_customer({}, cust_phone, msg)
                 if out.get("ok"):
                     review_sent += 1
                 else:

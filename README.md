@@ -56,9 +56,8 @@ in Meta's webhook config.
 - `GET  /health` — health check
 - `GET  /whatsapp` — Meta verification handshake
 - `POST /whatsapp` — incoming WhatsApp messages (JSON)
-- `POST /telegram/setup` — register a bot's Telegram token + webhook (auth: `X-Sesly-Preview-Token`)
-- `POST /telegram/disconnect` — remove a bot's Telegram webhook (auth: `X-Sesly-Preview-Token`)
-- `POST /telegram/webhook/<bot_id>` — incoming Telegram update for a specific bot
+- `POST /telegram/webhook` — incoming Telegram update (single master bot)
+- `POST /telegram/admin/register-webhook` — one-time webhook setup (auth: `X-Sesly-Preview-Token`)
 
 ## Routing rules
 
@@ -72,17 +71,31 @@ Voice notes are transcribed via OpenAI Whisper, then routed exactly like text.
 
 ## Telegram
 
-Each bot can optionally also serve Telegram. The owner creates a bot in
-[@BotFather](https://t.me/BotFather), pastes the token in the dashboard, and
-Sesly calls `/telegram/setup` to register a webhook back to
-`/telegram/webhook/<bot_id>`. The same `_handle_message()` pipeline that
-serves WhatsApp serves Telegram — only the I/O layer differs.
+Single master Telegram bot for the whole platform — exact same shape as
+the single WhatsApp number. The bot's token lives in `TELEGRAM_BOT_TOKEN`
+env var on sesly-bot, NOT in the database. Customers DM the master bot
+and type `/<handle>` to switch between businesses (or click a deep link
+like `t.me/<username>?start=<handle>` to land directly in a specific bot).
 
-Customer identifier convention:
+### Setup (one-time)
+
+1. Create the bot in [@BotFather](https://t.me/BotFather) → get a token.
+2. Add to sesly-bot Vercel env vars:
+   - `TELEGRAM_BOT_TOKEN=<the token>`  (required)
+   - `TELEGRAM_BOT_USERNAME=<username without @>`  (optional, skips a getMe call on each cold start)
+   - `TELEGRAM_WEBHOOK_SECRET=<random 32-char string>`  (optional but recommended)
+3. Redeploy sesly-bot.
+4. Register the webhook once:
+   ```bash
+   curl -X POST "https://sesly-bot.vercel.app/telegram/admin/register-webhook" \
+     -H "X-Sesly-Preview-Token: $SESLY_PREVIEW_TOKEN"
+   ```
+5. (Dashboard) set `NEXT_PUBLIC_TELEGRAM_BOT_USERNAME=<username>` on the dashboard Vercel project so the per-bot "Telegram" tab can show the share link.
+
+### Customer identifier convention
 
 - WhatsApp: `+994501234567` (E.164)
 - Telegram: `tg:123456789` (Telegram `chat_id`)
 
-Optional env var `TELEGRAM_WEBHOOK_SECRET` enables shared-secret validation
-on the webhook header (`X-Telegram-Bot-Api-Secret-Token`). Set the same
-value in Vercel env vars and Telegram will echo it back on every update.
+Both formats are stored opaquely in `conversations.customer_phone` and
+`bookings.customer_phone`.
