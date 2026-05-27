@@ -673,6 +673,101 @@ def _send_to_customer(bot: dict, customer_phone: str, text: str) -> dict:
         return {"ok": False, "error": str(e), "channel": "whatsapp"}
 
 
+@app.route("/telegram/admin/status", methods=["GET", "POST", "OPTIONS"])
+def telegram_admin_status():
+    """Diagnostic: report exactly why Telegram isn't responding.
+
+    Auth: shared X-Sesly-Preview-Token.
+    Returns: { token_set, token_starts, getMe, webhookInfo, expected_url }
+    """
+    if request.method == "OPTIONS":
+        resp = jsonify({})
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Sesly-Preview-Token"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        return resp
+
+    expected = os.getenv("SESLY_PREVIEW_TOKEN")
+    if not expected:
+        return jsonify({"ok": False, "error": "preview_token_not_configured"}), 503
+    supplied = (
+        request.headers.get("X-Sesly-Preview-Token")
+        or request.args.get("token")  # convenience for browser checks
+    )
+    if supplied != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    token = _telegram_token()
+    base_url = (
+        os.getenv("PUBLIC_BASE_URL") or "https://sesly-bot.vercel.app"
+    ).rstrip("/")
+    expected_url = f"{base_url}/telegram/webhook"
+
+    out: dict = {
+        "token_set": bool(token),
+        "token_starts": (token[:8] + "…") if token else None,
+        "expected_webhook_url": expected_url,
+        "TELEGRAM_BOT_USERNAME_env": os.getenv("TELEGRAM_BOT_USERNAME") or None,
+        "TELEGRAM_WEBHOOK_SECRET_set": bool(os.getenv("TELEGRAM_WEBHOOK_SECRET")),
+    }
+
+    if not token:
+        out["next_step"] = (
+            "Set TELEGRAM_BOT_TOKEN env var on the sesly-bot Vercel "
+            "project, redeploy, then call /telegram/admin/register-webhook."
+        )
+        return jsonify(out)
+
+    # Probe the token
+    me = tg.get_me(token)
+    out["getMe"] = me
+
+    # Probe what webhook Telegram currently has registered
+    try:
+        import requests
+        r = requests.get(
+            f"https://api.telegram.org/bot{token}/getWebhookInfo",
+            timeout=10,
+        )
+        info = r.json()
+        if info.get("ok"):
+            result = info.get("result") or {}
+            out["webhookInfo"] = {
+                "current_url": result.get("url"),
+                "has_custom_certificate": result.get("has_custom_certificate"),
+                "pending_update_count": result.get("pending_update_count"),
+                "last_error_date": result.get("last_error_date"),
+                "last_error_message": result.get("last_error_message"),
+                "max_connections": result.get("max_connections"),
+                "ip_address": result.get("ip_address"),
+            }
+            # Diagnose
+            current = result.get("url") or ""
+            if not current:
+                out["diagnosis"] = (
+                    "Webhook is NOT registered with Telegram. Call POST "
+                    "/telegram/admin/register-webhook to register it."
+                )
+            elif current != expected_url:
+                out["diagnosis"] = (
+                    f"Webhook points at {current!r} but we expected {expected_url!r}. "
+                    f"Call /telegram/admin/register-webhook to fix."
+                )
+            elif result.get("last_error_message"):
+                out["diagnosis"] = (
+                    f"Webhook URL is correct but Telegram is getting an error: "
+                    f"{result.get('last_error_message')!r}. Check sesly-bot logs."
+                )
+            else:
+                out["diagnosis"] = "Looks healthy. If still no replies, check sesly-bot Vercel logs."
+        else:
+            out["webhookInfo_error"] = info
+    except Exception as e:
+        out["webhookInfo_error"] = f"{type(e).__name__}: {e}"
+
+    return jsonify(out)
+
+
 @app.route("/telegram/admin/register-webhook", methods=["POST", "OPTIONS"])
 def telegram_admin_register_webhook():
     """One-time webhook registration (admin-only). Call this once after
