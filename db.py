@@ -69,6 +69,34 @@ def get_bot_by_handle(handle: str) -> Optional[dict]:
     return None
 
 
+def get_telegram_router_for_business(business_id: str) -> Optional[dict]:
+    """Find the bot in this business that has Telegram credentials. Used as
+    the outgoing router for Telegram customers — when a booking belongs to
+    a sub-bot like /aysel_salon that doesn't have its own Telegram token,
+    we still need to deliver reminders / review prompts through the
+    business's single Telegram entry point."""
+    if not business_id:
+        return None
+    try:
+        r = (
+            client()
+            .table("bots")
+            .select(
+                "id, handle, business_id, telegram_bot_token, "
+                "telegram_bot_username, telegram_bot_id"
+            )
+            .eq("business_id", business_id)
+            .not_.is_("telegram_bot_token", "null")
+            .limit(1)
+            .maybe_single()
+            .execute()
+        )
+        return r.data if r else None
+    except Exception as e:
+        print(f"[db] get_telegram_router_for_business failed: {e}")
+        return None
+
+
 def get_bot_for_telegram(bot_id: str) -> Optional[dict]:
     """Fetch a bot row including its Telegram credentials. Used by the
     /telegram/webhook/<bot_id> handler to validate the incoming update and

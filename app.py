@@ -619,15 +619,31 @@ def send_message():
 
 def _send_to_customer(bot: dict, customer_phone: str, text: str) -> dict:
     """Route an outgoing message based on the customer_phone prefix.
-    - "tg:<chat_id>"  → Telegram (uses bot.telegram_bot_token)
+
+    - "tg:<chat_id>"  → Telegram. Uses bot.telegram_bot_token if present,
+                        otherwise falls back to the business's Telegram
+                        router (the bot in this business that owns the
+                        Telegram setup). This lets reminders / review
+                        prompts for sub-bots like /aysel_salon go out via
+                        the single @seslyaibot entry point.
     - "+994..."       → WhatsApp (uses META_PHONE_NUMBER_ID)
     Returns {ok: bool, error?: str, channel: 'telegram' | 'whatsapp'}.
     """
     if tg.is_telegram_customer(customer_phone):
         chat_id = tg.customer_phone_to_chat_id(customer_phone)
         token = (bot or {}).get("telegram_bot_token")
+        # Cascade to business router when this specific bot has no Telegram
+        # token of its own (the typical case for sub-bots).
+        if not token and bot and bot.get("business_id"):
+            router = db.get_telegram_router_for_business(bot["business_id"])
+            if router:
+                token = router.get("telegram_bot_token")
         if not token or not chat_id:
-            return {"ok": False, "error": "missing telegram token or chat_id", "channel": "telegram"}
+            return {
+                "ok": False,
+                "error": "no telegram router for this business",
+                "channel": "telegram",
+            }
         out = tg.send_message(token, chat_id, text)
         out["channel"] = "telegram"
         return out
@@ -775,7 +791,23 @@ def telegram_webhook(bot_id: str):
 
 def _process_telegram_update(bot_id: str, update: dict) -> None:
     """Extract the message from a Telegram update and run it through the
-    standard _handle_message pipeline that WhatsApp uses."""
+    same _handle_message pipeline that WhatsApp uses.
+
+    Routing model — same shape as WhatsApp:
+      - "/start"                       → routed to the entry bot's handle
+                                         (e.g. "/sesly"), greets the customer
+                                         with the entry bot.
+      - "/start <handle>" (deep link)  → routed to "/<handle>" so links like
+                                         t.me/seslyaibot?start=aysel_salon
+                                         drop customers directly into Aysel.
+      - "/<handle>"                    → switches active bot (same as WhatsApp)
+      - "/menu"                        → shows the menu (same as WhatsApp)
+      - plain text / voice             → continues with the active bot, or
+                                         falls through to /sesly if none.
+
+    Replies are always sent via the Telegram entry bot's token (the one
+    that owns the webhook), regardless of which bot is currently serving
+    the customer."""
     msg = update.get("message") or update.get("edited_message") or {}
     if not msg:
         return
@@ -785,29 +817,23 @@ def _process_telegram_update(bot_id: str, update: dict) -> None:
     if chat_id is None:
         return
 
-    # Skip group / channel / supergroup chats for now — Sesly is 1:1 only
+    # Skip group / channel / supergroup chats — Sesly is 1:1 only
     if chat.get("type") not in (None, "private"):
         return
 
-    bot = db.get_bot_for_telegram(bot_id)
-    if not bot:
+    entry_bot = db.get_bot_for_telegram(bot_id)
+    if not entry_bot:
         print(f"[telegram] no active bot for id={bot_id}")
         return
-    if not bot.get("telegram_bot_token"):
-        print(f"[telegram] bot {bot_id} has no telegram_bot_token; ignoring update")
+    if not entry_bot.get("telegram_bot_token"):
+        print(f"[telegram] bot {bot_id} has no telegram_bot_token; ignoring")
         return
 
     customer_phone = tg.chat_id_to_customer_phone(chat_id)
-    print(f"[tg-in] bot={bot_id} chat={chat_id}")
-
-    # Auto-prime active_bot mapping so subsequent messages without /handle
-    # still route to this bot. (WhatsApp does this inside _handle_message;
-    # Telegram users won't type "/handle" — they're already in this bot's
-    # DM channel, so we set the session up front.)
-    try:
-        db.set_active_bot(customer_phone, bot["id"])
-    except Exception as e:
-        print(f"[telegram] set_active_bot failed: {e}")
+    entry_token = entry_bot["telegram_bot_token"]
+    entry_username = entry_bot.get("telegram_bot_username") or ""
+    entry_handle = entry_bot.get("handle") or "sesly"
+    print(f"[tg-in] entry={entry_handle} chat={chat_id}")
 
     body: str | None = None
     message_type = "text"
@@ -815,26 +841,31 @@ def _process_telegram_update(bot_id: str, update: dict) -> None:
     if "text" in msg:
         body = (msg.get("text") or "").strip()
 
-        # Treat Telegram's /start as a "show menu" intent for new users —
-        # respond with the bot's greeting instead of running it through the
-        # /handle parser.
-        if body in ("/start", "/start@" + (bot.get("telegram_bot_username") or "")):
-            greeting = bot.get("greeting_message") or "Salam! 👋"
-            db.save_message(bot["id"], customer_phone, "user", body, "text")
-            db.save_message(bot["id"], customer_phone, "assistant", greeting)
-            tg.send_message(bot["telegram_bot_token"], chat_id, greeting)
-            return
+        # Normalize Telegram-specific commands into WhatsApp-style /handle
+        # so _handle_message can route them. Without this, "/start" would
+        # be parsed as the literal handle "start" and 404.
+        if body == "/start" or body == f"/start@{entry_username}":
+            # Bare /start → enter the entry bot's handle
+            body = f"/{entry_handle}"
+        elif body.startswith("/start "):
+            # Deep link: /start <payload> → /<payload>
+            payload = body[7:].strip().split()[0] if body[7:].strip() else ""
+            body = f"/{payload}" if payload else f"/{entry_handle}"
+        elif body.startswith("/start@") and " " in body:
+            # /start@seslyaibot aysel_salon — same deep link, group-style
+            tail = body.split(" ", 1)[1].strip().split()[0] if " " in body else ""
+            body = f"/{tail}" if tail else f"/{entry_handle}"
 
     elif "voice" in msg or "audio" in msg:
         vfile = (msg.get("voice") or msg.get("audio") or {})
         file_id = vfile.get("file_id")
         if not file_id:
-            tg.send_message(bot["telegram_bot_token"], chat_id, "Sesli mesajı oxuya bilmədim.")
+            tg.send_message(entry_token, chat_id, "Sesli mesajı oxuya bilmədim.")
             return
-        transcript = tg.transcribe_voice(bot["telegram_bot_token"], file_id)
+        transcript = tg.transcribe_voice(entry_token, file_id)
         if not transcript:
             tg.send_message(
-                bot["telegram_bot_token"], chat_id,
+                entry_token, chat_id,
                 "Sesli mesajınızı anlaya bilmədim, zəhmət olmasa yenidən cəhd edin və ya yazılı göndərin."
             )
             return
@@ -844,21 +875,32 @@ def _process_telegram_update(bot_id: str, update: dict) -> None:
 
     elif "photo" in msg or "document" in msg or "video" in msg or "sticker" in msg:
         tg.send_message(
-            bot["telegram_bot_token"], chat_id,
+            entry_token, chat_id,
             "Hələlik yalnız yazılı və sesli mesajları qəbul edirəm."
         )
         return
 
     else:
         tg.send_message(
-            bot["telegram_bot_token"], chat_id,
+            entry_token, chat_id,
             "Hələlik yalnız yazılı və sesli mesajları qəbul edirəm."
         )
         return
 
     if not body:
-        tg.send_message(bot["telegram_bot_token"], chat_id, "Boş mesaj qəbul edildi. Zəhmət olmasa mətn yazın.")
+        tg.send_message(entry_token, chat_id, "Boş mesaj qəbul edildi. Zəhmət olmasa mətn yazın.")
         return
+
+    # If this customer has no active bot yet (first message that isn't a
+    # /handle / /start), pin them to the Telegram entry bot so they don't
+    # accidentally fall through to /sesly in a different business.
+    if not body.startswith("/"):
+        try:
+            existing = db.get_active_bot(customer_phone)
+            if not existing:
+                db.set_active_bot(customer_phone, entry_bot["id"])
+        except Exception as e:
+            print(f"[telegram] active-bot prime failed: {e}")
 
     reply, served_by = _handle_message(customer_phone, body, message_type=message_type)
 
@@ -879,7 +921,7 @@ def _process_telegram_update(bot_id: str, update: dict) -> None:
                 voice_id = served_by.get("voice_voice_id")
                 audio_path = tts.synthesize(reply, voice_id)
                 if audio_path:
-                    send_result = tg.send_voice(bot["telegram_bot_token"], chat_id, audio_path)
+                    send_result = tg.send_voice(entry_token, chat_id, audio_path)
                     if send_result.get("ok"):
                         voice_sent = True
                     else:
@@ -888,7 +930,7 @@ def _process_telegram_update(bot_id: str, update: dict) -> None:
             print(f"[tg-voice-reply] exception: {e}")
 
     if not voice_sent:
-        tg.send_message(bot["telegram_bot_token"], chat_id, reply)
+        tg.send_message(entry_token, chat_id, reply)
 
 
 @app.route("/cron/hourly", methods=["GET", "POST"])
@@ -971,8 +1013,11 @@ def _run_reminders():
 
         # Route by channel — Telegram or WhatsApp
         if tg.is_telegram_customer(cust_phone):
+            # _send_to_customer cascades to the business's Telegram router
+            # when this specific bot doesn't have its own token, so /aysel_salon
+            # sub-bot reminders still flow out via @seslyaibot.
             bot_full = db.get_bot_for_telegram(b["bot_id"])
-            if not bot_full or not bot_full.get("telegram_bot_token"):
+            if not bot_full:
                 skipped += 1
                 continue
             try:
@@ -1083,13 +1128,16 @@ def _run_auto_complete():
         )
 
         if tg.is_telegram_customer(cust_phone):
+            # _send_to_customer cascades to the business's Telegram router.
             bot_full = db.get_bot_for_telegram(b["bot_id"])
-            if not bot_full or not bot_full.get("telegram_bot_token"):
+            if not bot_full:
                 continue
             try:
                 out = _send_to_customer(bot_full, cust_phone, msg)
                 if out.get("ok"):
                     review_sent += 1
+                else:
+                    print(f"[auto-complete] tg review failed: {out.get('error')}")
             except Exception as e:
                 print(f"[auto-complete] tg review send failed: {e}")
             continue
