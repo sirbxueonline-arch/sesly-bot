@@ -688,8 +688,14 @@ def _process_one_message(msg: dict, phone_number_id: str | None) -> None:
     #     voice ONLY (no text duplicate).
     #   - If voice path fails for ANY reason (TTS down, quota, send error),
     #     fall back to text so the customer always gets an answer.
+    # Global kill switch — disable voice replies for ALL bots regardless
+    # of their voice_reply_enabled toggle. Removed once we ship a higher
+    # quality AZ-native voice.
+    voice_replies_disabled = os.getenv("VOICE_REPLIES_DISABLED", "").lower() in ("1", "true", "yes")
+
     should_voice = (
-        message_type == "voice"
+        not voice_replies_disabled
+        and message_type == "voice"
         and served_by
         and served_by.get("voice_reply_enabled")
     )
