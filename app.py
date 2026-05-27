@@ -276,7 +276,8 @@ def health():
 
 @app.route("/debug", methods=["GET"])
 def debug():
-    """Diagnostic endpoint — confirms env + DB + OpenAI connectivity."""
+    """Diagnostic endpoint — confirms env + DB + OpenAI + voice pipeline."""
+    eleven_key = os.getenv("ELEVENLABS_API_KEY") or ""
     out = {
         "env": {
             "SUPABASE_URL": bool(os.getenv("SUPABASE_URL")),
@@ -284,23 +285,35 @@ def debug():
             "SUPABASE_SERVICE_ROLE_KEY_starts": (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "")[:6],
             "META_ACCESS_TOKEN_set": bool(os.getenv("META_ACCESS_TOKEN")),
             "META_VERIFY_TOKEN_set": bool(os.getenv("META_VERIFY_TOKEN")),
+            "META_PHONE_NUMBER_ID_set": bool(os.getenv("META_PHONE_NUMBER_ID")),
             "OPENAI_API_KEY_set": bool(os.getenv("OPENAI_API_KEY")),
+            "ELEVENLABS_API_KEY_set": bool(eleven_key),
+            "ELEVENLABS_API_KEY_starts": eleven_key[:6],
+            "ELEVENLABS_DEFAULT_VOICE": os.getenv("ELEVENLABS_DEFAULT_VOICE") or None,
+            "SESLY_PREVIEW_TOKEN_set": bool(os.getenv("SESLY_PREVIEW_TOKEN")),
             "AI_MODEL": ai.MODEL,
         }
     }
     # Probe DB
     try:
-        bots = db.client().table("bots").select("handle, is_active, display_name").execute()
+        bots = db.client().table("bots").select(
+            "handle, is_active, display_name, voice_reply_enabled, voice_voice_id"
+        ).execute()
         out["bots_count"] = len(bots.data or [])
         out["handles"] = [
-            {"handle": b.get("handle"), "is_active": b.get("is_active"), "name": b.get("display_name")}
+            {
+                "handle": b.get("handle"),
+                "is_active": b.get("is_active"),
+                "name": b.get("display_name"),
+                "voice_reply_enabled": b.get("voice_reply_enabled"),
+                "voice_voice_id": b.get("voice_voice_id"),
+            }
             for b in (bots.data or [])
         ][:20]
     except Exception as e:
         out["db_error"] = f"{type(e).__name__}: {e}"
 
-    # Probe OpenAI chat completions (using the same client + model as the
-    # main reply path)
+    # Probe OpenAI chat completions
     try:
         c = ai.client()
         resp = c.chat.completions.create(
@@ -314,6 +327,47 @@ def debug():
     except Exception as e:
         out["openai_error"] = f"{type(e).__name__}: {e}"
         out["openai_model_tried"] = ai.MODEL
+
+    # Probe ffmpeg availability (needed for OGG/Opus conversion → voice notes)
+    try:
+        import tts
+        ff = tts._ffmpeg_path()
+        out["ffmpeg_available"] = bool(ff)
+        out["ffmpeg_path"] = ff if ff else None
+    except Exception as e:
+        out["ffmpeg_error"] = f"{type(e).__name__}: {e}"
+
+    # Probe ElevenLabs — tiny synth to see if the key is valid AND has quota
+    if eleven_key:
+        try:
+            import tts
+            voice_id = os.getenv("ELEVENLABS_DEFAULT_VOICE") or tts.DEFAULT_VOICE_ID
+            import requests
+            r = requests.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                headers={
+                    "xi-api-key": eleven_key,
+                    "Content-Type": "application/json",
+                    "Accept": "audio/mpeg",
+                },
+                json={
+                    "text": "ok",
+                    "model_id": "eleven_multilingual_v2",
+                    "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+                },
+                timeout=15,
+            )
+            out["elevenlabs_status"] = r.status_code
+            if r.status_code != 200:
+                out["elevenlabs_error"] = r.text[:400]
+            else:
+                out["elevenlabs_ok"] = True
+                out["elevenlabs_bytes"] = len(r.content)
+                out["elevenlabs_voice_id"] = voice_id
+        except Exception as e:
+            out["elevenlabs_exception"] = f"{type(e).__name__}: {e}"
+    else:
+        out["elevenlabs_skipped"] = "ELEVENLABS_API_KEY not set"
 
     return out
 
