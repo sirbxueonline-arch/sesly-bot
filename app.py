@@ -839,6 +839,14 @@ def telegram_webhook():
 
     update = request.get_json(silent=True) or {}
 
+    # Idempotency guard. Telegram retries webhook deliveries if we're slow
+    # (cold start + OpenAI call can easily push past Telegram's timeout),
+    # which would otherwise produce duplicate replies.
+    update_id = update.get("update_id")
+    if update_id and db.telegram_update_seen(update_id):
+        print(f"[telegram] skipping duplicate update_id={update_id}")
+        return jsonify({"ok": True, "skipped": "duplicate"}), 200
+
     try:
         _process_telegram_update(update)
     except Exception as e:

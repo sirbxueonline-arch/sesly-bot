@@ -69,6 +69,38 @@ def get_bot_by_handle(handle: str) -> Optional[dict]:
     return None
 
 
+def telegram_update_seen(update_id: int) -> bool:
+    """Idempotency guard. Returns True if this Telegram update_id has
+    already been processed (caller should skip), False if new (caller
+    should process it).
+
+    Telegram retries webhooks if our response is slow. Without this guard
+    a single message can get two replies. Backed by the
+    telegram_processed_updates table (migration 016).
+    """
+    if not update_id:
+        return False
+    try:
+        client().table("telegram_processed_updates").insert(
+            {"update_id": int(update_id)}
+        ).execute()
+        return False
+    except Exception as e:
+        s = str(e).lower()
+        # Postgres duplicate key violation OR PostgREST conflict response
+        if (
+            "duplicate" in s
+            or "23505" in s
+            or "already exists" in s
+            or "conflict" in s
+        ):
+            return True
+        # Any other error — log and let the message through (we'd rather
+        # double-reply than drop a message entirely)
+        print(f"[tg-dedup] insert error (allowing through): {e}")
+        return False
+
+
 def get_bot_staff(bot_id: str) -> list[dict]:
     """Active staff members for a bot, ordered as the owner arranged them."""
     if not bot_id:
