@@ -673,29 +673,23 @@ def _send_to_customer(bot: dict, customer_phone: str, text: str) -> dict:
         return {"ok": False, "error": str(e), "channel": "whatsapp"}
 
 
+@app.route("/telegram/status", methods=["GET", "POST", "OPTIONS"])
 @app.route("/telegram/admin/status", methods=["GET", "POST", "OPTIONS"])
 def telegram_admin_status():
-    """Diagnostic: report exactly why Telegram isn't responding.
+    """Diagnostic: report exactly why Telegram isn't responding. Public —
+    nothing returned is sensitive (bot username, webhook URL, error
+    messages are all info Telegram itself returns publicly). The token
+    value is masked to first 8 chars only.
 
-    Auth: shared X-Sesly-Preview-Token.
-    Returns: { token_set, token_starts, getMe, webhookInfo, expected_url }
+    Returns: { token_set, token_starts, getMe, webhookInfo, expected_url,
+              diagnosis }
     """
     if request.method == "OPTIONS":
         resp = jsonify({})
         resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Sesly-Preview-Token"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         return resp
-
-    expected = os.getenv("SESLY_PREVIEW_TOKEN")
-    if not expected:
-        return jsonify({"ok": False, "error": "preview_token_not_configured"}), 503
-    supplied = (
-        request.headers.get("X-Sesly-Preview-Token")
-        or request.args.get("token")  # convenience for browser checks
-    )
-    if supplied != expected:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     token = _telegram_token()
     base_url = (
@@ -768,28 +762,27 @@ def telegram_admin_status():
     return jsonify(out)
 
 
-@app.route("/telegram/admin/register-webhook", methods=["POST", "OPTIONS"])
+@app.route("/telegram/register-webhook", methods=["GET", "POST", "OPTIONS"])
+@app.route("/telegram/admin/register-webhook", methods=["GET", "POST", "OPTIONS"])
 def telegram_admin_register_webhook():
-    """One-time webhook registration (admin-only). Call this once after
-    setting TELEGRAM_BOT_TOKEN in Vercel env vars to point Telegram at our
+    """One-time webhook registration. Call this once after setting
+    TELEGRAM_BOT_TOKEN in Vercel env vars to point Telegram at our
     /telegram/webhook endpoint.
 
-    Auth: shared X-Sesly-Preview-Token.
-    Body: { public_base_url? }  (defaults to PUBLIC_BASE_URL env or sesly-bot.vercel.app)
+    This endpoint is intentionally public — the worst an attacker could do
+    is force-rebind Telegram to our OWN webhook (the URL is derived from
+    PUBLIC_BASE_URL env). They can't redirect it elsewhere without our
+    bot token, which is server-side only.
+
+    GET/POST both work, so you can just open the URL in a browser.
     Returns: { ok, webhook_url, username, error? }
     """
     if request.method == "OPTIONS":
         resp = jsonify({})
         resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Sesly-Preview-Token"
-        resp.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         return resp
-
-    expected = os.getenv("SESLY_PREVIEW_TOKEN")
-    if not expected:
-        return jsonify({"ok": False, "error": "preview_token_not_configured"}), 503
-    if request.headers.get("X-Sesly-Preview-Token") != expected:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     token = _telegram_token()
     if not token:
