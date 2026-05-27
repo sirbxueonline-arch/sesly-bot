@@ -681,45 +681,62 @@ def _process_one_message(msg: dict, phone_number_id: str | None) -> None:
         return
 
     reply, served_by = _handle_message(customer_phone, body, message_type=message_type)
-    _send_text(phone_number_id, reply_to, reply)
 
-    # Optional voice reply: only when the user spoke AND the bot is configured
-    # for sesli cavablar AND TTS is configured. Best-effort; never blocks text.
-    try:
-        should_voice = (
-            message_type == "voice"
-            and served_by
-            and served_by.get("voice_reply_enabled")
-        )
-        if not should_voice:
-            # Help user debug from Vercel logs why voice didn't fire
-            if message_type == "voice":
-                if not served_by:
-                    print("[voice-reply] skipped: no served_by bot (menu / no-bot path)")
-                elif not served_by.get("voice_reply_enabled"):
-                    print(
-                        f"[voice-reply] skipped: voice_reply_enabled is OFF "
-                        f"for bot {served_by.get('handle')!r}. "
-                        "Enable it in dashboard → İnteqrasiyalar → Sesli cavablar."
-                    )
-        else:
+    # Reply policy: mirror how the customer messaged.
+    #   - Customer typed text     → bot replies with text.
+    #   - Customer sent voice AND voice_reply_enabled is ON → bot replies with
+    #     voice ONLY (no text duplicate).
+    #   - If voice path fails for ANY reason (TTS down, quota, send error),
+    #     fall back to text so the customer always gets an answer.
+    should_voice = (
+        message_type == "voice"
+        and served_by
+        and served_by.get("voice_reply_enabled")
+    )
+
+    voice_sent = False
+    if should_voice:
+        try:
             import tts
             if not tts.is_configured():
                 print(
-                    "[voice-reply] skipped: ELEVENLABS_API_KEY not set on this "
-                    "deployment. Add it in Vercel → sesly-bot → Settings → "
-                    "Environment Variables."
+                    "[voice-reply] falling back to text: ELEVENLABS_API_KEY "
+                    "not set on this deployment."
                 )
             else:
                 voice_id = served_by.get("voice_voice_id")
                 print(f"[voice-reply] synthesizing with voice_id={voice_id or '<default>'}")
                 audio_path = tts.synthesize(reply, voice_id)
                 if audio_path:
-                    _send_audio(phone_number_id, reply_to, audio_path)
+                    send_result = _send_audio(phone_number_id, reply_to, audio_path)
+                    if send_result.get("ok"):
+                        voice_sent = True
+                        print(
+                            f"[voice-reply] voice sent OK "
+                            f"({send_result.get('kind')}). Skipping text."
+                        )
+                    else:
+                        print(
+                            f"[voice-reply] WhatsApp audio send failed: "
+                            f"{send_result.get('error')}. Falling back to text."
+                        )
                 else:
-                    print("[voice-reply] tts.synthesize returned None")
-    except Exception as e:
-        print(f"[voice-reply] best-effort failed: {e}")
+                    print("[voice-reply] tts.synthesize returned None — falling back to text.")
+        except Exception as e:
+            print(f"[voice-reply] best-effort failed: {e} — falling back to text.")
+    else:
+        # Log why voice wasn't even attempted (only when the customer spoke)
+        if message_type == "voice":
+            if not served_by:
+                print("[voice-reply] not attempted: no served_by bot (menu / no-bot path)")
+            elif not served_by.get("voice_reply_enabled"):
+                print(
+                    f"[voice-reply] not attempted: voice_reply_enabled is OFF "
+                    f"for bot {served_by.get('handle')!r}."
+                )
+
+    if not voice_sent:
+        _send_text(phone_number_id, reply_to, reply)
 
 
 if __name__ == "__main__":
