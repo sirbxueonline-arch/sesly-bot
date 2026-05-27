@@ -214,6 +214,9 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
             if db.is_over_message_limit(bot):
                 return LIMIT_REACHED_MESSAGE, bot
             db.save_message(bot["id"], customer_phone, "user", extra, message_type)
+            # Enrich bot dict with staff list + customer history for AI context
+            bot["_staff"] = db.get_bot_staff(bot["id"])
+            bot["_customer_context"] = db.get_customer_history(bot["id"], customer_phone)
             history = db.get_recent_history(bot["id"], customer_phone)
             if history and history[-1].get("content") == extra:
                 history = history[:-1]
@@ -256,6 +259,23 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
         db.save_message(bot["id"], customer_phone, "assistant", thank_you)
         return thank_you, bot
 
+    # Customer-initiated cancellation — "ləğv et" / "iptal" / "cancel" /
+    # "gəlməyəcəm" → cancel their most recent pending or confirmed booking.
+    if db.detect_cancellation_intent(message):
+        cancelled = db.cancel_latest_booking(bot["id"], customer_phone)
+        if cancelled:
+            when = cancelled.get("scheduled_time_text") or cancelled.get("scheduled_at") or ""
+            service = cancelled.get("service") or "Randevu"
+            reply = (
+                f"Anlaşıldı, randevunuz ləğv edildi 🗓\n\n"
+                f"{service}{(' — ' + when) if when else ''}\n\n"
+                "Başqa vaxta qeyd etmək istəsəniz, yazın — sizə yer açım."
+            )
+            db.save_message(bot["id"], customer_phone, "user", message, message_type)
+            db.save_message(bot["id"], customer_phone, "assistant", reply)
+            return reply, bot
+        # No active booking found — fall through to AI which can clarify
+
     away = _away_response(bot)
     if away:
         db.save_message(bot["id"], customer_phone, "user", message, message_type)
@@ -263,6 +283,12 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
         return away, bot
 
     db.save_message(bot["id"], customer_phone, "user", message, message_type)
+
+    # Enrich bot dict with staff list + customer history for the system prompt.
+    # ai.py reads bot['_staff'] and bot['_customer_context'].
+    bot["_staff"] = db.get_bot_staff(bot["id"])
+    bot["_customer_context"] = db.get_customer_history(bot["id"], customer_phone)
+
     history = db.get_recent_history(bot["id"], customer_phone)
     if history and history[-1].get("content") == message:
         history = history[:-1]
@@ -567,6 +593,187 @@ def send_message():
             print(f"[send-message] log save failed: {e}")
 
     return jsonify({"ok": True})
+
+
+@app.route("/cron/hourly", methods=["GET", "POST"])
+def cron_hourly():
+    """Combined hourly cron — runs reminders + auto-complete in one call."""
+    cron_secret = os.getenv("CRON_SECRET")
+    fallback = os.getenv("SESLY_CRON_TOKEN")
+    auth = request.headers.get("Authorization", "")
+    if not ((cron_secret and auth == f"Bearer {cron_secret}") or
+            (fallback and request.headers.get("X-Sesly-Cron-Token") == fallback)):
+        return jsonify({"error": "unauthorized"}), 401
+
+    rem = _run_reminders()
+    ac = _run_auto_complete()
+    return jsonify({"ok": True, "reminders": rem, "auto_complete": ac})
+
+
+def _run_reminders():
+    """
+    Find confirmed bookings whose scheduled_at is 60-90 min away AND
+    we haven't sent a reminder yet — send a WhatsApp reminder.
+    Idempotent via bookings.reminder_sent_at (migration 014).
+    """
+    try:
+        from datetime import datetime, timezone, timedelta
+        now_utc = datetime.now(timezone.utc)
+        window_start = (now_utc + timedelta(minutes=60)).isoformat()
+        window_end = (now_utc + timedelta(minutes=90)).isoformat()
+
+        c = db.client()
+        # Find confirmed bookings whose scheduled_at falls in the 60-90 min
+        # window from now AND that haven't had a reminder sent
+        result = (
+            c.table("bookings")
+            .select(
+                "id, bot_id, customer_phone, customer_name, service, "
+                "scheduled_at, scheduled_time_text, reminder_sent_at, "
+                "staff_name_at_booking, "
+                "bots(display_name, businesses(phone))"
+            )
+            .eq("status", "confirmed")
+            .gte("scheduled_at", window_start)
+            .lt("scheduled_at", window_end)
+            .is_("reminder_sent_at", "null")
+            .execute()
+        )
+    except Exception as e:
+        return {"error": f"db_query: {e}"}
+
+    sent = 0
+    skipped = 0
+    for b in result.data or []:
+        cust_phone = (b.get("customer_phone") or "").strip()
+        if not cust_phone:
+            skipped += 1
+            continue
+
+        # Build the reminder message
+        bot_row = b.get("bots") or {}
+        biz_name = bot_row.get("display_name") or "Sesly"
+        service = b.get("service") or "Randevu"
+        when = b.get("scheduled_time_text") or ""
+        if not when and b.get("scheduled_at"):
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(b["scheduled_at"].replace("Z", "+00:00"))
+                when = dt.strftime("%H:%M")
+            except Exception:
+                pass
+        staff = b.get("staff_name_at_booking") or ""
+        staff_part = f" — {staff} ilə" if staff else ""
+        cust_name = b.get("customer_name") or ""
+        name_part = f"{cust_name}, " if cust_name else ""
+
+        msg = (
+            f"🔔 Salam {name_part}{biz_name}-dan xatırlatma.\n\n"
+            f"Bir saatdan sonra — {when} — {service}{staff_part} üçün gözləyirik.\n\n"
+            f"Gələ bilməsəniz, sadəcə 'ləğv et' yazın."
+        )
+
+        # Send via Meta directly
+        digits = "".join(ch for ch in cust_phone if ch.isdigit())
+        phone_number_id = os.getenv("META_PHONE_NUMBER_ID")
+        if not digits or not phone_number_id:
+            skipped += 1
+            continue
+        try:
+            _send_text(phone_number_id, digits, msg)
+            # Mark as sent
+            db.client().table("bookings").update({
+                "reminder_sent_at": datetime.now(timezone.utc).isoformat()
+            }).eq("id", b["id"]).execute()
+            sent += 1
+            print(f"[reminder] sent for booking={b['id']} customer={cust_phone}")
+        except Exception as e:
+            print(f"[reminder] failed for {b['id']}: {e}")
+            skipped += 1
+
+    return {"window_min": "60-90", "sent": sent, "skipped": skipped}
+
+
+def _run_auto_complete():
+    """
+    Find confirmed bookings whose scheduled_at + duration finished 1-26
+    hours ago AND are still 'confirmed' — auto-mark them as 'completed'
+    AND send the review request (same flow as the manual '✓ Bitdi' button).
+    """
+    try:
+        from datetime import datetime, timezone, timedelta
+        now_utc = datetime.now(timezone.utc)
+        # Look at finished bookings in the last 26 hours (one-day catch-up buffer)
+        window_start = (now_utc - timedelta(hours=26)).isoformat()
+        window_end = (now_utc - timedelta(hours=1)).isoformat()  # > 1h ago
+
+        c = db.client()
+        result = (
+            c.table("bookings")
+            .select(
+                "id, bot_id, customer_phone, customer_name, service, "
+                "scheduled_at, duration_minutes, status, review_requested_at, "
+                "bots(display_name)"
+            )
+            .eq("status", "confirmed")
+            .gte("scheduled_at", window_start)
+            .lt("scheduled_at", window_end)
+            .execute()
+        )
+    except Exception as e:
+        return {"error": f"db_query: {e}"}
+
+    completed = 0
+    review_sent = 0
+    skipped = 0
+    for b in result.data or []:
+        # Must be past its end (scheduled_at + duration)
+        try:
+            start = datetime.fromisoformat((b["scheduled_at"] or "").replace("Z", "+00:00"))
+            end = start + timedelta(minutes=int(b.get("duration_minutes") or 60))
+            if end > now_utc:
+                skipped += 1
+                continue
+        except Exception:
+            skipped += 1
+            continue
+
+        # Mark completed
+        try:
+            db.client().table("bookings").update({
+                "status": "completed",
+                "review_requested_at": now_utc.isoformat(),
+                "review_requested_via": "cron",
+            }).eq("id", b["id"]).execute()
+            completed += 1
+        except Exception as e:
+            print(f"[auto-complete] update failed for {b['id']}: {e}")
+            skipped += 1
+            continue
+
+        # Send review request via WhatsApp
+        cust_phone = b.get("customer_phone") or ""
+        digits = "".join(ch for ch in cust_phone if ch.isdigit())
+        phone_number_id = os.getenv("META_PHONE_NUMBER_ID")
+        if not digits or not phone_number_id:
+            continue
+        bot_row = b.get("bots") or {}
+        biz_name = bot_row.get("display_name") or "Sesly"
+        cust_name = (b.get("customer_name") or "").strip() or "müştəri"
+        service = (b.get("service") or "").strip()
+        msg = (
+            f"Salam {cust_name}! {biz_name}-da görüşünüz necə oldu? 💛\n\n"
+            f"1-dən 5-ə qədər ulduz verə bilərsiniz (sadəcə rəqəm yazın). "
+            f"Rəyiniz bizə daha yaxşı xidmət vermək üçün kömək edir."
+            + (f"\n\n(Xidmət: {service})" if service else "")
+        )
+        try:
+            _send_text(phone_number_id, digits, msg)
+            review_sent += 1
+        except Exception as e:
+            print(f"[auto-complete] review send failed: {e}")
+
+    return {"completed": completed, "review_sent": review_sent, "skipped": skipped}
 
 
 @app.route("/cron/digest", methods=["GET", "POST"])

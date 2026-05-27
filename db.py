@@ -69,6 +69,84 @@ def get_bot_by_handle(handle: str) -> Optional[dict]:
     return None
 
 
+def get_bot_staff(bot_id: str) -> list[dict]:
+    """Active staff members for a bot, ordered as the owner arranged them."""
+    if not bot_id:
+        return []
+    try:
+        r = (
+            client()
+            .table("bot_staff")
+            .select("id, name, role, bio, emoji")
+            .eq("bot_id", bot_id)
+            .eq("is_active", True)
+            .order("sort_order")
+            .execute()
+        )
+        return r.data or []
+    except Exception as e:
+        print(f"[db] get_bot_staff failed: {e}")
+        return []
+
+
+def get_customer_history(bot_id: str, customer_phone: str) -> dict:
+    """
+    Return a small summary of this customer's history with the bot. Used
+    to make the AI greet returning customers naturally.
+
+    {
+      "is_returning": bool,
+      "total_visits": int,
+      "last_visit_at": iso str or None,
+      "last_service": str or None,
+      "no_shows": int,
+      "name": str or None,
+    }
+    """
+    if not bot_id or not customer_phone:
+        return {"is_returning": False}
+    try:
+        # First: try the summary view
+        view = (
+            client()
+            .table("v_customer_last_visit")
+            .select("*")
+            .eq("bot_id", bot_id)
+            .eq("customer_phone", customer_phone)
+            .maybe_single()
+            .execute()
+        )
+        if not view or not view.data:
+            return {"is_returning": False}
+        info = view.data
+
+        # Also fetch the most recent booking row for the name + last service
+        recent = (
+            client()
+            .table("bookings")
+            .select("customer_name, service, status, scheduled_at")
+            .eq("bot_id", bot_id)
+            .eq("customer_phone", customer_phone)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        recent_row = (recent.data or [None])[0] or {}
+
+        return {
+            "is_returning": (info.get("total_visits") or 0) >= 1,
+            "total_visits": info.get("total_visits") or 0,
+            "completed_visits": info.get("completed_visits") or 0,
+            "last_visit_at": info.get("last_visit_at"),
+            "last_service": recent_row.get("service"),
+            "no_shows": info.get("no_show_count") or 0,
+            "name": recent_row.get("customer_name"),
+        }
+    except Exception as e:
+        print(f"[db] get_customer_history failed: {e}")
+        return {"is_returning": False}
+
+
 def get_bot_by_id(bot_id: str) -> Optional[dict]:
     """Look up bot config by id. Used by the dashboard preview endpoint."""
     bid = (bot_id or "").strip()
@@ -369,6 +447,28 @@ def save_booking(
 
     conv_id = _get_or_create_conversation(bot_id, customer_phone)
 
+    # Resolve staff_id from staff_name (if AI provided one)
+    staff_name = (booking.get("staff_name") or "").strip() or None
+    staff_id = None
+    if staff_name:
+        try:
+            sres = (
+                client()
+                .table("bot_staff")
+                .select("id, name")
+                .eq("bot_id", bot_id)
+                .eq("is_active", True)
+                .ilike("name", f"%{staff_name}%")
+                .limit(1)
+                .execute()
+            )
+            row = (sres.data or [None])[0]
+            if row:
+                staff_id = row["id"]
+                staff_name = row["name"]  # snap to canonical name
+        except Exception as e:
+            print(f"[bookings] staff lookup failed for {staff_name!r}: {e}")
+
     payload = {
         "bot_id": bot_id,
         "conversation_id": conv_id,
@@ -381,6 +481,8 @@ def save_booking(
         "price_azn": booking.get("price_azn"),
         "status": status,
         "notes": booking.get("notes"),
+        "staff_id": staff_id,
+        "staff_name_at_booking": staff_name,
         "raw_payload": booking,
     }
     # Strip Nones — Postgres prefers omitted over null for some columns
@@ -443,6 +545,102 @@ def save_booking(
 
     if inserted and status == "confirmed":
         _notify_owner_of_booking(bot_id, customer_phone, payload)
+
+
+def detect_cancellation_intent(message: str) -> bool:
+    """Return True if the customer message looks like 'cancel my booking'."""
+    if not message:
+        return False
+    text = message.strip().lower()
+    if len(text) > 80:
+        return False
+    triggers = [
+        "ləğv et", "ləğv edirəm", "ləğv olun",
+        "ləğv etmək istəyirəm", "ləğv olunsun",
+        "iptal", "iptal et",       # TR-leaning but real users say this
+        "cancel", "cancel my appointment",
+        "imtina edirəm", "gəlməyəcəm", "gələ bilməyəcəm",
+        "randevunu ləğv", "randevumu ləğv",
+    ]
+    return any(t in text for t in triggers)
+
+
+def cancel_latest_booking(bot_id: str, customer_phone: str) -> Optional[dict]:
+    """
+    Cancel the most recent active booking for this customer.
+    Returns the cancelled booking row or None if nothing to cancel.
+    """
+    if not bot_id or not customer_phone:
+        return None
+    try:
+        recent = (
+            client()
+            .table("bookings")
+            .select("id, service, scheduled_at, scheduled_time_text, status")
+            .eq("bot_id", bot_id)
+            .eq("customer_phone", customer_phone)
+            .in_("status", ["pending", "confirmed"])
+            .order("scheduled_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        row = (recent.data or [None])[0]
+        if not row:
+            return None
+        client().table("bookings").update({"status": "cancelled"}).eq("id", row["id"]).execute()
+        print(f"[bookings] cancelled {row['id']} for {customer_phone}")
+        row["status"] = "cancelled"
+        return row
+    except Exception as e:
+        print(f"[bookings] cancel failed: {e}")
+        return None
+
+
+def check_slot_conflict(
+    bot_id: str,
+    scheduled_at: Optional[str],
+    duration_minutes: Optional[int],
+    exclude_booking_id: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Return a conflicting booking if the proposed slot overlaps with another
+    confirmed/pending booking. Returns None if no conflict.
+    Conflict window = [scheduled_at, scheduled_at + duration_minutes].
+    """
+    if not bot_id or not scheduled_at:
+        return None
+    try:
+        from datetime import datetime, timedelta
+        normalized = scheduled_at.replace("Z", "+00:00") if "Z" in scheduled_at else scheduled_at
+        start = datetime.fromisoformat(normalized)
+        end = start + timedelta(minutes=duration_minutes or 60)
+        # Pull bookings on the same day, filter overlap in Python (small set)
+        day_start = start.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        day_end = (start.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).isoformat()
+        q = (
+            client()
+            .table("bookings")
+            .select("id, service, scheduled_at, duration_minutes, status, customer_name, customer_phone")
+            .eq("bot_id", bot_id)
+            .in_("status", ["pending", "confirmed"])
+            .gte("scheduled_at", day_start)
+            .lt("scheduled_at", day_end)
+            .execute()
+        )
+        for b in (q.data or []):
+            if exclude_booking_id and b["id"] == exclude_booking_id:
+                continue
+            other_start = datetime.fromisoformat(
+                b["scheduled_at"].replace("Z", "+00:00") if "Z" in (b.get("scheduled_at") or "") else b["scheduled_at"]
+            )
+            other_end = other_start + timedelta(minutes=b.get("duration_minutes") or 60)
+            # Overlap if start < other_end AND end > other_start
+            if start < other_end and end > other_start:
+                return b
+        return None
+    except Exception as e:
+        print(f"[bookings] conflict check failed: {e}")
+        return None
 
 
 def detect_and_save_review(
@@ -555,6 +753,14 @@ def _notify_owner_of_booking(bot_id: str, customer_phone: str, payload: dict) ->
             except Exception:
                 when_display = when
 
+        # Check for conflicting bookings in the same time slot
+        conflict = check_slot_conflict(
+            bot_id,
+            payload.get("scheduled_at"),
+            payload.get("duration_minutes"),
+            exclude_booking_id=payload.get("id"),
+        )
+
         # WhatsApp owner ping
         if owner_phone:
             lines = ["🔔 Yeni randevu", ""]
@@ -569,14 +775,24 @@ def _notify_owner_of_booking(bot_id: str, customer_phone: str, payload: dict) ->
                 lines.append(f"⏱  {payload['duration_minutes']} dəq")
             if payload.get("price_azn") is not None:
                 lines.append(f"💰 {payload['price_azn']} AZN")
+            if payload.get("staff_name_at_booking"):
+                lines.append(f"💇 {payload['staff_name_at_booking']}")
             if payload.get("notes"):
                 lines.append(f"📝 {payload['notes']}")
+            if conflict:
+                other_when = conflict.get("scheduled_at") or ""
+                other_svc = conflict.get("service") or "başqa randevu"
+                other_cust = conflict.get("customer_name") or conflict.get("customer_phone") or "müştəri"
+                lines.append("")
+                lines.append("⚠️ DİQQƏT — eyni vaxt aralığında başqa randevu var:")
+                lines.append(f"   • {other_svc} · {other_cust}")
+                lines.append("   Dashboard-da yoxlayın.")
             lines.append("")
             lines.append(f"({biz_name})")
 
             ok = send_to_owner(owner_phone, "\n".join(lines))
             if ok:
-                print(f"[notify] owner alerted at {owner_phone}")
+                print(f"[notify] owner alerted at {owner_phone}{' (CONFLICT)' if conflict else ''}")
         else:
             print("[notify] business has no owner phone configured — skipping WA")
 

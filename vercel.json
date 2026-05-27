@@ -11,6 +11,7 @@
     { "src": "/(.*)", "dest": "/api/index.py" }
   ],
   "crons": [
-    { "path": "/cron/digest", "schedule": "0 16 * * *" }
+    { "path": "/cron/digest",  "schedule": "0 16 * * *" },
+    { "path": "/cron/hourly",  "schedule": "0 * * * *" }
   ]
 }

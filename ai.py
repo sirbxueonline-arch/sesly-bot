@@ -33,6 +33,51 @@ def client() -> OpenAI:
     return _client
 
 
+def _staff_block(staff: list[dict]) -> str:
+    """Inject the bot's active staff list so the AI knows who customers can pick."""
+    if not staff:
+        return ""
+    lines = ["════════ İŞÇİLƏR ════════"]
+    for s in staff:
+        bits = [s.get("name") or ""]
+        if s.get("role"):
+            bits.append(f"({s['role']})")
+        line = "• " + " ".join(bits)
+        if s.get("bio"):
+            line += f" — {s['bio']}"
+        lines.append(line)
+    lines.append("")
+    lines.append("Əgər müştəri konkret işçi adı çəkməyibsə, soruş: 'Hansı işçi ilə işləmək istəyirsiniz?'")
+    lines.append("Əgər müştəri 'fərqi yoxdur' / 'kimsə' desə, sən özün uyğun olan birini seç və yaz.")
+    lines.append("BOOKING JSON-da `staff_name` sahəsini doldur (siyahıdakı dəqiq ad).")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _customer_context_block(ctx: Optional[dict]) -> str:
+    """Inject what we know about the current customer so the AI greets naturally."""
+    if not ctx or not ctx.get("is_returning"):
+        return ""
+    parts = ["════════ MÜŞTƏRİ TARİXÇƏSİ ════════"]
+    name = ctx.get("name")
+    if name:
+        parts.append(f"• Ad: {name} (artıq tanıyırsan — adını söyləməsini istəmə)")
+    visits = ctx.get("total_visits") or 0
+    if visits >= 1:
+        parts.append(f"• Daha əvvəl {visits} dəfə ziyarət etib")
+    if ctx.get("last_service"):
+        parts.append(f"• Son xidmət: {ctx['last_service']}")
+    if ctx.get("last_visit_at"):
+        parts.append(f"• Son ziyarət: {ctx['last_visit_at'][:10]}")
+    no_shows = ctx.get("no_shows") or 0
+    if no_shows >= 2:
+        parts.append(f"• ⚠️ {no_shows} dəfə gəlməyib — daxili nəzərə al, müştəriyə deyəmə.")
+    parts.append("")
+    parts.append("Qayıdan müştəri olduğu üçün isti şəkildə salamla: 'Xoş gəlmisiniz [ad]! Yenidən görüşürük 💛'")
+    parts.append("")
+    return "\n".join(parts)
+
+
 def _personality_block(personality: str) -> str:
     """Return a personality-specific instructions block. Bot owner picks
     one of four tones in dashboard → İnteqrasiyalar → Bot xarakteri."""
@@ -160,6 +205,8 @@ def build_system_prompt(bot: dict) -> str:
         f"• Növ: {biz_type}\n"
         f"• İş saatları: {bot.get('working_hours') or 'Məlumat yoxdur'}\n"
         f"• Xidmətlər və qiymətlər:\n{bot.get('services') or 'Məlumat yoxdur'}\n\n"
+        f"{_staff_block(bot.get('_staff') or [])}\n"
+        f"{_customer_context_block(bot.get('_customer_context'))}\n"
         f"{_personality_block(bot.get('personality') or 'friendly')}\n"
         "════════ DAVRANIŞ ════════\n"
         "• Qısa cavab ver — 1-3 cümlə kifayətdir.\n"
@@ -178,7 +225,7 @@ def build_system_prompt(bot: dict) -> str:
         "════════ RANDEVU/SİFARİŞ ÇIXARMA ════════\n"
         "Müştəri xüsusi tarix/saat və ya xidmət barədə danışırsa, cavabının ƏN SONUNA\n"
         "(adi mətndən sonra ayrı sətrdə) bu gizli sətri əlavə et:\n\n"
-        "[BOOKING]{\"service\":\"...\",\"date\":\"YYYY-MM-DD\",\"time\":\"HH:MM\",\"duration_minutes\":60,\"price_azn\":15,\"customer_name\":\"...\",\"status\":\"confirmed\",\"notes\":\"...\"}[/BOOKING]\n\n"
+        "[BOOKING]{\"service\":\"...\",\"date\":\"YYYY-MM-DD\",\"time\":\"HH:MM\",\"duration_minutes\":60,\"price_azn\":15,\"customer_name\":\"...\",\"staff_name\":\"...\",\"status\":\"confirmed\",\"notes\":\"...\"}[/BOOKING]\n\n"
         "STATUS QAYDASI:\n"
         "• `confirmed` — siz \"Təsdiqləndi\" / \"Yazdım\" / \"Sizi yazdım\" və müştəri razı oldu.\n"
         "• `pending` — müştəri vaxt soruşur və ya təklif edir, hələ yekun razılıq yoxdur.\n"
