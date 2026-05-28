@@ -264,11 +264,16 @@ def get_bot_by_id(bot_id: str) -> Optional[dict]:
     return None
 
 
-# Plan limits — mirrors lib/plans.ts in the dashboard
+# Plan limits — mirrors lib/plans.ts in the dashboard.
+# Plan rename May 2026: start→pro, pro→max. We keep the old keys as
+# aliases so this code still works on databases that haven't applied
+# migration 018 yet.
 PLAN_LIMITS = {
     "free":  {"messages": 100,  "bots": 1, "name": "Sınaq"},
-    "start": {"messages": 1000, "bots": 3, "name": "Başlanğıc"},
-    "pro":   {"messages": None, "bots": 5, "name": "Pro"},
+    "pro":   {"messages": 1000, "bots": 3, "name": "Pro"},
+    "max":   {"messages": None, "bots": 5, "name": "Max"},
+    # Legacy aliases:
+    "start": {"messages": 1000, "bots": 3, "name": "Pro"},  # old Başlanğıc → Pro
 }
 
 
