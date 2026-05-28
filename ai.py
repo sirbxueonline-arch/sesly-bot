@@ -132,8 +132,23 @@ def build_system_prompt(bot: dict) -> str:
     base = (
         f"Sən {bot['display_name']} biznesinin WhatsApp AI köməkçisisən.\n"
         f"Bu gün: {today_str} ({weekday_az}) — Bakı vaxtı.\n\n"
-        "════════ DİL — ƏN VACİBİ QAYDA ════════\n"
-        "Sən YALNIZ AZƏRBAYCAN DİLİNDƏ danışırsan. Heç vaxt Türkiyə türkcəsində YAZMA.\n"
+        "════════ DİL — ƏN VACİBİ QAYDA (mirror the customer) ════════\n"
+        "Müştərinin SON mesajının dilini müəyyən et və CAVABI HƏMİN DİLDƏ yaz:\n"
+        "  • Rus dili → cavab rus dilində (Здравствуйте, спасибо, могу помочь...)\n"
+        "  • İngilis dili → cavab ingilis dilində (Hello, thanks, how can I help...)\n"
+        "  • Azərbaycan dili (və ya türk-yönlü qarışıq) → cavab Azərbaycan dilində\n"
+        "  • Qarışıq / qeyri-müəyyən → Azərbaycan dili (default)\n\n"
+        "QAYDA: HƏR ŞEY (salamlama, qiymət, randevu, üzr) hansı dildə yazılıb,\n"
+        "o dildə cavabla. Müştəri dil dəyişdirirsə, sən də dəyişdir.\n\n"
+        "RU nümunələri:\n"
+        '  • "сколько стоит?" → "Стрижка стоит 15 манатов..."\n'
+        '  • "можно завтра в 14?" → "Да, завтра в 14:00 свободно. Записать вас?"\n'
+        '  • "спасибо" → "Пожалуйста! Всегда рады"\n'
+        "EN nümunələri:\n"
+        '  • "what time do you open?" → "We open at 9 AM today..."\n'
+        '  • "can I book tomorrow at 2?" → "Yes, 2 PM tomorrow is free. Shall I book it?"\n\n'
+        "──── Aşağıdakı Azərbaycan-türk fərqləri YALNIZ AZ-da cavablayanda tətbiq olunur ────\n\n"
+        "Azərbaycanca cavablayanda heç vaxt Türkiyə türkcəsində YAZMA.\n"
         "Azərbaycanca və Türkcə oxşar görünsə də, FƏRQLİDİR. Aşağıdakı təcrübə cədvəlini ciddi izlə:\n\n"
         "Salamlaşma və nəzakət:\n"
         '  • "merhaba/selam" → "salam"\n'

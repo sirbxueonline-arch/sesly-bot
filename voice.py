@@ -80,15 +80,19 @@ def download_meta_media(media_id: str) -> Optional[str]:
         return None
 
 
-def transcribe(file_path: str, language: str = "az") -> Optional[str]:
-    """Transcribe an audio file with Whisper."""
+def transcribe(file_path: str, language: Optional[str] = None) -> Optional[str]:
+    """Transcribe an audio file with Whisper.
+
+    By default we DON'T force a language — Whisper auto-detects, so a
+    Russian or English voice message is transcribed correctly instead
+    of being forced through the Azerbaijani phoneme model. Pass
+    language='az' explicitly only if you want to bias toward AZ."""
     try:
         with open(file_path, "rb") as f:
-            resp = client().audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                language=language,
-            )
+            kwargs: dict = {"model": "whisper-1", "file": f}
+            if language:
+                kwargs["language"] = language
+            resp = client().audio.transcriptions.create(**kwargs)
         return (resp.text or "").strip() or None
     except Exception as e:
         print(f"[voice] transcribe failed: {e}")
@@ -100,8 +104,9 @@ def transcribe(file_path: str, language: str = "az") -> Optional[str]:
             pass
 
 
-def transcribe_meta_media(media_id: str, language: str = "az") -> Optional[str]:
-    """Convenience: download Meta media then transcribe."""
+def transcribe_meta_media(media_id: str, language: Optional[str] = None) -> Optional[str]:
+    """Convenience: download Meta media then transcribe.
+    Whisper auto-detects language by default; pass language='az' to bias."""
     path = download_meta_media(media_id)
     if not path:
         return None
