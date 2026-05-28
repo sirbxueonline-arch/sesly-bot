@@ -1125,7 +1125,13 @@ def cron_hourly():
 
     rem = _run_reminders()
     ac = _run_auto_complete()
-    return jsonify({"ok": True, "reminders": rem, "auto_complete": ac})
+    mb = _run_morning_briefing()
+    return jsonify({
+        "ok": True,
+        "reminders": rem,
+        "auto_complete": ac,
+        "morning_briefing": mb,
+    })
 
 
 @app.route("/cron/admin/preview", methods=["GET"])
@@ -1267,14 +1273,25 @@ def cron_admin_preview():
 
 @app.route("/cron/admin/trigger", methods=["GET", "POST"])
 def cron_admin_trigger():
-    """Manually run the reminder + auto-complete logic NOW, bypassing the
-    cron schedule. Public — the call is idempotent (reminder_sent_at
-    blocks duplicates) so the worst possible "abuse" is making a
-    reminder fire a few minutes earlier than scheduled, which is not
-    actually a problem worth gating against."""
+    """Manually run reminders + auto-complete + morning briefing NOW,
+    bypassing the cron schedule. Public — every step is idempotent
+    (reminder_sent_at, auto-complete status check, morning_briefing_sent_on)
+    so re-triggering doesn't double-send.
+
+    Pass ?force_briefing=1 to ignore the time-of-day gate and the
+    "already sent today" check, so you can preview the morning message
+    on demand.
+    """
+    force = request.args.get("force_briefing") in ("1", "true", "yes")
     rem = _run_reminders()
     ac = _run_auto_complete()
-    return jsonify({"ok": True, "reminders": rem, "auto_complete": ac})
+    mb = _run_morning_briefing(force=force)
+    return jsonify({
+        "ok": True,
+        "reminders": rem,
+        "auto_complete": ac,
+        "morning_briefing": mb,
+    })
 
 
 def _run_reminders():
@@ -1499,6 +1516,207 @@ def _run_auto_complete():
             print(f"[auto-complete] review send failed: {e}")
 
     return {"completed": completed, "review_sent": review_sent, "skipped": skipped}
+
+
+def _run_morning_briefing(force: bool = False) -> dict:
+    """At 9:00 AM Baku, send each owner a WhatsApp recap of today's
+    confirmed bookings. Fires from /cron/hourly which runs every hour;
+    we gate by current Baku hour AND by businesses.morning_briefing_sent_on
+    (idempotent — only one briefing per business per day).
+
+    Skips businesses with 0 bookings today (no spam) and those who have
+    explicitly opted out (morning_briefing_enabled=false).
+    """
+    from datetime import datetime, timezone, timedelta
+
+    now_baku = datetime.now(timezone(timedelta(hours=4)))
+    today_baku = now_baku.date()
+
+    # Gate by hour — only run between 9:00 and 9:59 Baku. The cron fires
+    # at the top of every hour, so this catches exactly the 9 AM run.
+    if not force and now_baku.hour != 9:
+        return {"skipped": "not_9am", "baku_hour": now_baku.hour}
+
+    # Day window for today's bookings (Baku → UTC)
+    day_start_baku = now_baku.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end_baku = day_start_baku + timedelta(days=1)
+    day_start_utc = day_start_baku.astimezone(timezone.utc).isoformat()
+    day_end_utc = day_end_baku.astimezone(timezone.utc).isoformat()
+
+    phone_number_id = os.getenv("META_PHONE_NUMBER_ID")
+    if not phone_number_id:
+        return {"error": "META_PHONE_NUMBER_ID not set"}
+
+    sent = 0
+    skipped_already = 0
+    skipped_no_bookings = 0
+    skipped_no_phone = 0
+    skipped_opt_out = 0
+    failed = 0
+
+    try:
+        c = db.client()
+        # Pull every active business with a verified phone
+        biz_res = (
+            c.table("businesses")
+            .select(
+                "id, name, phone, phone_verified, "
+                "morning_briefing_sent_on, morning_briefing_enabled"
+            )
+            .eq("phone_verified", True)
+            .execute()
+        )
+    except Exception as e:
+        return {"error": f"db_businesses: {e}"}
+
+    for biz in biz_res.data or []:
+        biz_id = biz["id"]
+
+        # Opt-out
+        if biz.get("morning_briefing_enabled") is False:
+            skipped_opt_out += 1
+            continue
+
+        # Idempotency — already sent today?
+        last_sent = biz.get("morning_briefing_sent_on")
+        if not force and last_sent and last_sent == today_baku.isoformat():
+            skipped_already += 1
+            continue
+
+        owner_phone = (biz.get("phone") or "").strip()
+        if not owner_phone:
+            skipped_no_phone += 1
+            continue
+
+        # Find today's confirmed bookings for any bot in this business
+        try:
+            bot_res = (
+                c.table("bots")
+                .select("id, handle")
+                .eq("business_id", biz_id)
+                .eq("is_active", True)
+                .execute()
+            )
+            bot_ids = [b["id"] for b in bot_res.data or []]
+            if not bot_ids:
+                skipped_no_bookings += 1
+                continue
+            book_res = (
+                c.table("bookings")
+                .select(
+                    "scheduled_at, scheduled_time_text, service, "
+                    "customer_name, customer_phone, staff_name_at_booking"
+                )
+                .in_("bot_id", bot_ids)
+                .eq("status", "confirmed")
+                .gte("scheduled_at", day_start_utc)
+                .lt("scheduled_at", day_end_utc)
+                .order("scheduled_at")
+                .execute()
+            )
+            todays = book_res.data or []
+        except Exception as e:
+            print(f"[morning] booking fetch failed for {biz_id}: {e}")
+            failed += 1
+            continue
+
+        if not todays:
+            skipped_no_bookings += 1
+            # Still mark as "sent" so we don't keep re-checking every
+            # cron run for the rest of the day
+            try:
+                c.table("businesses").update({
+                    "morning_briefing_sent_on": today_baku.isoformat()
+                }).eq("id", biz_id).execute()
+            except Exception:
+                pass
+            continue
+
+        # Build the message
+        msg = _build_morning_briefing_text(biz.get("name") or "", todays)
+
+        # Send via WhatsApp to the owner's number
+        digits = "".join(ch for ch in owner_phone if ch.isdigit())
+        if not digits:
+            skipped_no_phone += 1
+            continue
+        try:
+            _send_text(phone_number_id, digits, msg)
+            c.table("businesses").update({
+                "morning_briefing_sent_on": today_baku.isoformat()
+            }).eq("id", biz_id).execute()
+            sent += 1
+            print(f"[morning] sent to {owner_phone} for biz={biz_id}")
+        except Exception as e:
+            print(f"[morning] send failed for {biz_id}: {e}")
+            failed += 1
+
+    return {
+        "baku_hour": now_baku.hour,
+        "date": today_baku.isoformat(),
+        "sent": sent,
+        "skipped_already_today": skipped_already,
+        "skipped_no_bookings": skipped_no_bookings,
+        "skipped_no_phone": skipped_no_phone,
+        "skipped_opt_out": skipped_opt_out,
+        "failed": failed,
+    }
+
+
+def _build_morning_briefing_text(biz_name: str, bookings: list[dict]) -> str:
+    """Compose the morning WhatsApp message. Kept small and skimmable —
+    owners read this on a phone first thing in the morning, not in an
+    inbox client."""
+    from datetime import datetime
+
+    n = len(bookings)
+    header = f"☀️ Sabahınız xeyir{', ' + biz_name if biz_name else ''}!\n\n"
+    intro = (
+        f"Bu gün {n} təsdiqlənmiş görüş var:\n\n"
+        if n != 1
+        else "Bu gün 1 təsdiqlənmiş görüş var:\n\n"
+    )
+
+    lines: list[str] = []
+    for b in bookings:
+        # Time: prefer the human text if AI set one, else parse scheduled_at
+        when_text = b.get("scheduled_time_text") or ""
+        if when_text:
+            # scheduled_time_text often looks like "2026-05-29 14:00" — keep
+            # only the time portion for readability in the briefing
+            parts = when_text.split()
+            when = parts[-1] if parts else when_text
+        else:
+            try:
+                dt = datetime.fromisoformat(
+                    (b.get("scheduled_at") or "").replace("Z", "+00:00")
+                )
+                # Convert UTC → Baku (UTC+4) for display
+                from datetime import timezone as tz, timedelta as td
+                dt_baku = dt.astimezone(tz(td(hours=4)))
+                when = dt_baku.strftime("%H:%M")
+            except Exception:
+                when = "—"
+
+        cust = (b.get("customer_name") or "").strip()
+        service = (b.get("service") or "").strip()
+        staff = (b.get("staff_name_at_booking") or "").strip()
+
+        # Build right side: "Aysel · saç" or "saç" or "Aysel"
+        parts: list[str] = []
+        if cust:
+            parts.append(cust)
+        if service:
+            parts.append(service.lower())
+        right = " · ".join(parts) if parts else "Görüş"
+        if staff:
+            right += f" ({staff})"
+
+        lines.append(f"• {when} — {right}")
+
+    body = "\n".join(lines)
+    footer = "\n\nHamısı: https://seslyai.com/dashboard/orders"
+    return header + intro + body + footer
 
 
 @app.route("/cron/digest", methods=["GET", "POST"])
