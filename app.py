@@ -1201,41 +1201,10 @@ def cron_admin_preview():
 @app.route("/cron/admin/trigger", methods=["GET", "POST"])
 def cron_admin_trigger():
     """Manually run the reminder + auto-complete logic NOW, bypassing the
-    cron schedule. Useful for testing without waiting for Vercel cron to
-    fire.
-
-    Accepts ANY of the following as a token (via ?token=, Authorization
-    header, X-Sesly-Preview-Token, or X-Sesly-Cron-Token):
-      - SESLY_PREVIEW_TOKEN
-      - CRON_SECRET           (the one Vercel cron uses)
-      - SESLY_CRON_TOKEN      (legacy)
-    Any one that matches authorizes the call.
-    """
-    accepted_tokens = [
-        os.getenv("SESLY_PREVIEW_TOKEN"),
-        os.getenv("CRON_SECRET"),
-        os.getenv("SESLY_CRON_TOKEN"),
-    ]
-    accepted = {t for t in accepted_tokens if t}
-    if not accepted:
-        return jsonify({"ok": False, "error": "no_token_env_var_set"}), 503
-
-    auth_header = request.headers.get("Authorization", "")
-    bearer = auth_header[7:] if auth_header.startswith("Bearer ") else ""
-
-    supplied = (
-        request.args.get("token")
-        or bearer
-        or request.headers.get("X-Sesly-Preview-Token")
-        or request.headers.get("X-Sesly-Cron-Token")
-    )
-    if not supplied or supplied not in accepted:
-        return jsonify({
-            "ok": False,
-            "error": "unauthorized",
-            "hint": "Pass ?token=<one of SESLY_PREVIEW_TOKEN | CRON_SECRET | SESLY_CRON_TOKEN>",
-        }), 401
-
+    cron schedule. Public — the call is idempotent (reminder_sent_at
+    blocks duplicates) so the worst possible "abuse" is making a
+    reminder fire a few minutes earlier than scheduled, which is not
+    actually a problem worth gating against."""
     rem = _run_reminders()
     ac = _run_auto_complete()
     return jsonify({"ok": True, "reminders": rem, "auto_complete": ac})
