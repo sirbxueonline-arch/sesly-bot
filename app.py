@@ -916,19 +916,34 @@ def _process_telegram_update(update: dict) -> None:
             # consistency with the WhatsApp E.164 format.
             if phone and not phone.startswith("+"):
                 phone = "+" + phone
+            first_name = contact.get("first_name") or from_user.get("first_name")
+            last_name = contact.get("last_name") or from_user.get("last_name")
             db.save_telegram_contact(
                 chat_id,
                 phone=phone or None,
-                first_name=contact.get("first_name") or from_user.get("first_name"),
-                last_name=contact.get("last_name") or from_user.get("last_name"),
+                first_name=first_name,
+                last_name=last_name,
                 username=from_user.get("username"),
                 language_code=from_user.get("language_code"),
             )
-            tg.send_message(
-                token, chat_id,
-                f"Təşəkkürlər! Nömrəniz qeyd olundu ({phone}). İndi sualınızı yazın.",
-                reply_markup=tg.remove_keyboard(),
-            )
+            # If Telegram didn't include a surname (most accounts only set
+            # a first name), follow up and ask for it explicitly so the
+            # owner has the full name in the dashboard / on bookings.
+            if first_name and not last_name:
+                db.set_telegram_awaiting_surname(chat_id, True)
+                tg.send_message(
+                    token, chat_id,
+                    f"Təşəkkürlər, {first_name}! 🙏 Soyadınızı da yazardınız? "
+                    "Biznes sahibi sizinlə əlaqə saxlamaq lazım olduqda "
+                    "tam adınızı görəcək.",
+                    reply_markup=tg.remove_keyboard(),
+                )
+            else:
+                tg.send_message(
+                    token, chat_id,
+                    f"Təşəkkürlər! Nömrəniz qeyd olundu ({phone}). İndi sualınızı yazın.",
+                    reply_markup=tg.remove_keyboard(),
+                )
         else:
             tg.send_message(
                 token, chat_id,
@@ -994,6 +1009,41 @@ def _process_telegram_update(update: dict) -> None:
     if body is None:
         return
 
+    # If we asked this customer for their surname after they shared their
+    # contact, the next message (this one, if it's plain text) is the
+    # surname. Save it and ack — don't run it through the AI.
+    if message_type == "text" and body and not body.startswith("/"):
+        try:
+            existing_contact = db.get_telegram_contact(chat_id)
+            if existing_contact and existing_contact.get("awaiting_surname"):
+                surname = body.strip()
+                # Sanity-check: only accept short, name-shaped input. Anything
+                # too long or containing question words probably means the
+                # customer ignored the prompt and is actually asking something.
+                looks_like_name = (
+                    len(surname) <= 60
+                    and "?" not in surname
+                    and not surname.lower().startswith(("salam", "necə", "qiymət", "nə ", "/"))
+                )
+                if looks_like_name:
+                    db.save_telegram_contact(
+                        chat_id,
+                        phone=None,  # don't overwrite existing phone
+                        last_name=surname,
+                        awaiting_surname=False,
+                    )
+                    first = existing_contact.get("first_name") or ""
+                    full = f"{first} {surname}".strip()
+                    tg.send_message(
+                        token, chat_id,
+                        f"Təşəkkürlər, {full}! ✅ İndi sualınızı yazın.",
+                    )
+                    return
+                # Customer ignored the prompt — clear flag, let message flow
+                db.set_telegram_awaiting_surname(chat_id, False)
+        except Exception as e:
+            print(f"[tg-surname] check failed: {e}")
+
     reply, served_by = _handle_message(customer_phone, body, message_type=message_type)
 
     # Voice replies on Telegram follow the same kill switch / per-bot toggle
@@ -1035,9 +1085,10 @@ def _process_telegram_update(update: dict) -> None:
                     token,
                     chat_id,
                     (
-                        "📞 Müştəri xidmətimiz üçün telefon nömrənizi "
-                        "paylaşa bilərsiniz — biznes lazım olduqda sizinlə "
-                        "əlaqə saxlamaq üçün istifadə edəcək."
+                        "📞 Müştəri xidmətimiz üçün ad, soyad və telefon "
+                        "nömrənizi paylaşa bilərsiniz — biznes lazım olduqda "
+                        "sizinlə əlaqə saxlamaq üçün istifadə edəcək. "
+                        "Düyməyə basın, biz qalanını həll edirik."
                     ),
                     reply_markup=tg.contact_request_keyboard(),
                 )

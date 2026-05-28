@@ -103,9 +103,11 @@ def save_telegram_contact(
     last_name: Optional[str] = None,
     username: Optional[str] = None,
     language_code: Optional[str] = None,
+    awaiting_surname: Optional[bool] = None,
 ) -> None:
     """Upsert a Telegram contact row. Called when a customer taps the
-    request_contact button and Telegram sends us their phone."""
+    request_contact button and Telegram sends us their phone, and again
+    later if we collect their surname via follow-up."""
     if not chat_id:
         return
     payload = {
@@ -115,6 +117,7 @@ def save_telegram_contact(
         "last_name": last_name,
         "username": username,
         "language_code": language_code,
+        "awaiting_surname": awaiting_surname,
         "updated_at": _utcnow_iso(),
     }
     # Drop Nones so we don't overwrite existing values with NULL on later
@@ -126,6 +129,21 @@ def save_telegram_contact(
         ).execute()
     except Exception as e:
         print(f"[db] save_telegram_contact failed: {e}")
+
+
+def set_telegram_awaiting_surname(chat_id: str | int, value: bool) -> None:
+    """Flip the awaiting_surname flag for a chat without touching other
+    fields. Used to mark "next message is the surname" and to clear it
+    after we've saved the response."""
+    if not chat_id:
+        return
+    try:
+        client().table("telegram_contacts").update({
+            "awaiting_surname": value,
+            "updated_at": _utcnow_iso(),
+        }).eq("chat_id", str(chat_id)).execute()
+    except Exception as e:
+        print(f"[db] set_telegram_awaiting_surname failed: {e}")
 
 
 def _utcnow_iso() -> str:
@@ -570,11 +588,28 @@ def save_booking(
         except Exception as e:
             print(f"[bookings] staff lookup failed for {staff_name!r}: {e}")
 
+    # Enrich customer_name with the Telegram contact's first+last name
+    # if the AI didn't already collect one. This means a customer who
+    # books via Telegram after sharing their contact gets "Aysel Mammadova"
+    # on the booking instead of an empty name field.
+    customer_name = booking.get("customer_name")
+    if not customer_name and customer_phone.startswith("tg:"):
+        try:
+            tg_chat_id = customer_phone[3:]
+            contact = get_telegram_contact(tg_chat_id)
+            if contact:
+                parts = [contact.get("first_name"), contact.get("last_name")]
+                joined = " ".join([p for p in parts if p]).strip()
+                if joined:
+                    customer_name = joined
+        except Exception as e:
+            print(f"[bookings] tg contact name lookup failed: {e}")
+
     payload = {
         "bot_id": bot_id,
         "conversation_id": conv_id,
         "customer_phone": customer_phone,
-        "customer_name": booking.get("customer_name"),
+        "customer_name": customer_name,
         "service": booking.get("service"),
         "scheduled_at": scheduled_at,
         "scheduled_time_text": scheduled_time_text,
