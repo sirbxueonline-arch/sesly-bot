@@ -688,22 +688,34 @@ def save_booking(
                     old.get("status") != "confirmed"
                     and payload.get("status") == "confirmed"
                 ):
-                    _notify_owner_of_booking(bot_id, customer_phone, payload)
+                    # Pass the existing id so the conflict check excludes itself
+                    _notify_owner_of_booking(
+                        bot_id, customer_phone, {**payload, "id": old["id"]}
+                    )
                 return
     except Exception as e:
         print(f"[booking] dedup check failed: {e}")
 
-    # No match — insert new
+    # No match — insert new. Capture the returned id so the downstream
+    # conflict check can exclude the just-inserted row (otherwise it
+    # flags itself as the conflict).
     inserted = False
+    inserted_id: Optional[str] = None
     try:
-        client().table("bookings").insert(payload).execute()
+        res = client().table("bookings").insert(payload).execute()
         inserted = True
-        print(f"[booking] inserted: {payload.get('service')} @ {payload.get('scheduled_at')}")
+        try:
+            inserted_id = ((res.data or [None])[0] or {}).get("id")
+        except Exception:
+            inserted_id = None
+        print(f"[booking] inserted: {payload.get('service')} @ {payload.get('scheduled_at')} (id={inserted_id})")
     except Exception as e:
         print(f"[booking] insert failed: {e}")
 
     if inserted and status == "confirmed":
-        _notify_owner_of_booking(bot_id, customer_phone, payload)
+        # Pass the new id explicitly so the conflict check can exclude itself
+        notify_payload = {**payload, "id": inserted_id} if inserted_id else payload
+        _notify_owner_of_booking(bot_id, customer_phone, notify_payload)
 
 
 def detect_cancellation_intent(message: str) -> bool:
