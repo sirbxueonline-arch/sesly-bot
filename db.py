@@ -513,11 +513,21 @@ def _should_merge_booking(old: dict, new_payload: dict, now_utc):
     if old_at and new_at and old_at == new_at:
         return True, "same scheduled_at slot"
 
-    # 2) Same service name (case-insensitive) → same appointment
+    # 2) Same service AND nearly-identical scheduled_at → same appointment.
+    # Same service alone is NOT enough:
+    #   - Customer booked "Saç kəsimi" 3 weeks ago + books today → 2 distinct
+    #   - Multi-step "haircut 14:00 + haircut 17:00" → 2 distinct
+    # Only the literal "AI restated the same booking in a follow-up turn"
+    # case should merge. Threshold is 5 min — tight enough that intentional
+    # back-to-back same-service bookings stay distinct.
     old_svc = (old.get("service") or "").strip().lower()
     new_svc = (new_payload.get("service") or "").strip().lower()
     if old_svc and new_svc and old_svc == new_svc:
-        return True, "same service"
+        if not old_at and not new_at:
+            return True, "same service, both unscheduled (still negotiating)"
+        if old_at and new_at and abs((old_at - new_at).total_seconds()) < 300:
+            return True, "same service within 5 min (likely AI restatement)"
+        # Otherwise: distinct bookings — don't merge
 
     # 3) Old was pending and new is confirmed within 30 min → status upgrade
     try:
@@ -575,13 +585,29 @@ def save_booking(
     scheduled_at = None
     scheduled_time_text = booking.get("time_text") or None
 
-    if date and time and len(date) == 10 and len(time) >= 4:
-        # The AI prompt anchors everything to Bakı vaxtı (UTC+4), so the time
-        # we receive is Baku-local. Stamp the offset explicitly so Postgres
-        # stores the correct UTC instant and downstream consumers (Google
-        # Calendar, dashboard) display the right wall-clock time.
-        scheduled_at = f"{date}T{time}:00+04:00"
-        scheduled_time_text = scheduled_time_text or f"{date} {time}"
+    # Validate + normalize. The AI sometimes emits "9:00" instead of
+    # "09:00", or "2026-5-30" instead of "2026-05-30" — both pass naive
+    # length checks but produce invalid ISO 8601 strings that crash
+    # downstream parsers.
+    import re
+    iso_date_ok = bool(date and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date))
+    time_match = re.fullmatch(r"(\d{1,2}):(\d{2})", time or "") if time else None
+    if iso_date_ok and time_match:
+        hh = int(time_match.group(1))
+        mm = int(time_match.group(2))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            # Pad single-digit hour to "09:00"
+            time_iso = f"{hh:02d}:{mm:02d}"
+            # The AI prompt anchors everything to Bakı vaxtı (UTC+4), so the
+            # time we receive is Baku-local. Stamp the offset explicitly so
+            # Postgres stores the correct UTC instant and downstream consumers
+            # (Google Calendar, dashboard) display the right wall-clock time.
+            scheduled_at = f"{date}T{time_iso}:00+04:00"
+            scheduled_time_text = scheduled_time_text or f"{date} {time_iso}"
+        else:
+            print(f"[booking] reject invalid time {time!r}: hh={hh}, mm={mm}")
+    elif date or time:
+        print(f"[booking] reject malformed date/time: date={date!r} time={time!r}")
 
     status = (booking.get("status") or "confirmed").strip().lower()
     if status not in ("pending", "confirmed", "cancelled", "completed", "no_show"):
@@ -771,24 +797,52 @@ def detect_cancellation_intent(message: str) -> bool:
 
 def cancel_latest_booking(bot_id: str, customer_phone: str) -> Optional[dict]:
     """
-    Cancel the most recent active booking for this customer.
+    Cancel the customer's NEXT upcoming booking for this bot — the one
+    that's about to happen, which is almost always what the customer
+    means when they say "cancel" without specifying which one.
+
     Returns the cancelled booking row or None if nothing to cancel.
+    Skips bookings that are already in the past (can't cancel something
+    that's already happened — owner should mark it no_show / completed
+    via the dashboard instead).
     """
     if not bot_id or not customer_phone:
         return None
     try:
-        recent = (
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+        # Soonest upcoming pending/confirmed booking. ASC order on
+        # scheduled_at, lower-bounded at now so past bookings don't match.
+        upcoming = (
             client()
             .table("bookings")
             .select("id, service, scheduled_at, scheduled_time_text, status")
             .eq("bot_id", bot_id)
             .eq("customer_phone", customer_phone)
             .in_("status", ["pending", "confirmed"])
-            .order("scheduled_at", desc=True)
+            .gte("scheduled_at", now_iso)
+            .order("scheduled_at", desc=False)
             .limit(1)
             .execute()
         )
-        row = (recent.data or [None])[0]
+        row = (upcoming.data or [None])[0]
+        # Fallback: if nothing upcoming, try the most-recently-created
+        # active booking (covers cases where scheduled_at is null because
+        # the AI captured a request without a confirmed time)
+        if not row:
+            recent = (
+                client()
+                .table("bookings")
+                .select("id, service, scheduled_at, scheduled_time_text, status")
+                .eq("bot_id", bot_id)
+                .eq("customer_phone", customer_phone)
+                .in_("status", ["pending", "confirmed"])
+                .is_("scheduled_at", "null")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            row = (recent.data or [None])[0]
         if not row:
             return None
         client().table("bookings").update({"status": "cancelled"}).eq("id", row["id"]).execute()
