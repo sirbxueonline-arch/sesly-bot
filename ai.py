@@ -426,7 +426,32 @@ def generate_reply_with_booking(
     except Exception as e:
         print(f"[ai] generation failed ({MODEL}): {e}")
 
+    # Best-effort language-matched fallback. We detect the customer's
+    # language from their message (basic char-class heuristic) and pick
+    # the right apology — much friendlier than always replying in AZ when
+    # the customer was writing in RU/EN.
+    return (_fallback_message(user_message), None, False)
+
+
+def _fallback_message(user_message: str) -> str:
+    """Pick a friendly apology in the customer's language."""
+    text = (user_message or "").strip()
+    if text:
+        # Cyrillic block → Russian
+        if any("Ѐ" <= ch <= "ӿ" for ch in text):
+            return (
+                "Извините, на секунду не могу ответить 🙏 "
+                "Попробуйте написать ещё раз через минуту — мы уже подключаемся."
+            )
+        # Mostly Latin ASCII with no AZ-specific chars → English
+        ascii_letters = sum(1 for ch in text if ch.isascii() and ch.isalpha())
+        az_chars = sum(1 for ch in text if ch in "əğıöşçüƏĞİÖŞÇÜ")
+        if ascii_letters > 5 and az_chars == 0:
+            return (
+                "Sorry, I can't reply this second 🙏 "
+                "Please try again in a minute — we're reconnecting."
+            )
     return (
-        "Üzr istəyirəm, hal-hazırda cavab verə bilmirəm. "
-        "Bir az sonra yenidən cəhd edin."
-    ), None, False
+        "Bir saniyə cavab verə bilmirəm 🙏 "
+        "Bir dəqiqədən sonra yenidən yazın — qoşuluruq."
+    )
