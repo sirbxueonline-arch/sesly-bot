@@ -218,12 +218,13 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
             # Enrich bot dict with staff list + customer history for AI context
             bot["_staff"] = db.get_bot_staff(bot["id"])
             bot["_customer_context"] = db.get_customer_history(bot["id"], customer_phone)
+            bot["_services_detail"] = db.get_bot_services_detail(bot["id"])
             history = db.get_recent_history(bot["id"], customer_phone)
             if history and history[-1].get("content") == extra:
                 history = history[:-1]
-            reply, booking, wants_cancel = ai.generate_reply_with_booking(bot, extra, history)
+            reply, _booking, wants_cancel, bookings = ai.generate_reply_with_booking(bot, extra, history)
             db.save_message(bot["id"], customer_phone, "assistant", reply)
-            if booking:
+            for booking in bookings:
                 db.save_booking(bot["id"], customer_phone, booking)
             if wants_cancel:
                 try:
@@ -291,16 +292,17 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
     db.save_message(bot["id"], customer_phone, "user", message, message_type)
 
     # Enrich bot dict with staff list + customer history for the system prompt.
-    # ai.py reads bot['_staff'] and bot['_customer_context'].
+    # ai.py reads bot['_staff'] and bot['_customer_context'] and ['_services_detail'].
     bot["_staff"] = db.get_bot_staff(bot["id"])
     bot["_customer_context"] = db.get_customer_history(bot["id"], customer_phone)
+    bot["_services_detail"] = db.get_bot_services_detail(bot["id"])
 
     history = db.get_recent_history(bot["id"], customer_phone)
     if history and history[-1].get("content") == message:
         history = history[:-1]
-    reply, booking, wants_cancel = ai.generate_reply_with_booking(bot, message, history)
+    reply, _booking, wants_cancel, bookings = ai.generate_reply_with_booking(bot, message, history)
     db.save_message(bot["id"], customer_phone, "assistant", reply)
-    if booking:
+    for booking in bookings:
         db.save_booking(bot["id"], customer_phone, booking)
     # AI-detected cancellation (covers cases the keyword pre-check missed —
     # e.g. "ola bilmir, başqa vaxt yazaram" or "не приду извините")
@@ -1802,8 +1804,13 @@ def preview():
         if role in ("user", "assistant") and content:
             clean_history.append({"role": role, "content": content})
 
-    reply, booking, wants_cancel = ai.generate_reply_with_booking(bot, message, clean_history)
-    resp = jsonify({"reply": reply, "booking": booking, "wants_cancel": wants_cancel})
+    reply, booking, wants_cancel, bookings = ai.generate_reply_with_booking(bot, message, clean_history)
+    resp = jsonify({
+        "reply": reply,
+        "booking": booking,
+        "bookings": bookings,  # full list for multi-step
+        "wants_cancel": wants_cancel,
+    })
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 

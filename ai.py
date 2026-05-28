@@ -78,6 +78,29 @@ def _customer_context_block(ctx: Optional[dict]) -> str:
     return "\n".join(parts)
 
 
+def _service_hours_block(services: list[dict]) -> str:
+    """If any service has its own working_hours (different from the bot's
+    overall schedule), surface them so the AI refuses bookings outside
+    those windows. Empty string if no overrides — bot-level hours apply
+    to everything."""
+    if not services:
+        return ""
+    overrides = [s for s in services if (s.get("working_hours") or "").strip()]
+    if not overrides:
+        return ""
+    lines = ["", "• Xidmət üzrə xüsusi saatlar (yuxarıdakı ümumi cədvələ deyil, BUNA tabe):"]
+    for s in overrides:
+        name = s.get("name") or "—"
+        hours = s.get("working_hours")
+        lines.append(f"  · {name}: {hours}")
+    lines.append(
+        "  (Müştəri bu xidmətlərdən birini bu saatlardan KƏNAR vaxta\n"
+        "   istəsə, '{xidmət} saatlarımız {saat}-dır, başqa vaxt seçə\n"
+        "   bilərsiniz?' kimi xəbərdarlıq et və yeni vaxt soruş.)"
+    )
+    return "\n".join(lines) + "\n"
+
+
 def _personality_block(personality: str) -> str:
     """Return a personality-specific instructions block. Bot owner picks
     one of four tones in dashboard → İnteqrasiyalar → Bot xarakteri."""
@@ -219,7 +242,9 @@ def build_system_prompt(bot: dict) -> str:
         "════════ BİZNES MƏLUMATLARI ════════\n"
         f"• Növ: {biz_type}\n"
         f"• İş saatları: {bot.get('working_hours') or 'Məlumat yoxdur'}\n"
-        f"• Xidmətlər və qiymətlər:\n{bot.get('services') or 'Məlumat yoxdur'}\n\n"
+        f"• Xidmətlər və qiymətlər:\n{bot.get('services') or 'Məlumat yoxdur'}\n"
+        f"{_service_hours_block(bot.get('_services_detail') or [])}"
+        "\n"
         f"{_staff_block(bot.get('_staff') or [])}\n"
         f"{_customer_context_block(bot.get('_customer_context'))}\n"
         f"{_personality_block(bot.get('personality') or 'friendly')}\n"
@@ -274,6 +299,15 @@ def build_system_prompt(bot: dict) -> str:
         "Cavabın:\n"
         "Hi! 2 PM tomorrow is free 🌸 Can I get your name?\n"
         '[BOOKING]{"service":"Manikür","date":"2026-05-27","time":"14:00","price_azn":12,"status":"pending"}[/BOOKING]\n\n'
+        "─── Çox-mərhələli randevu (eyni mesajda 2+ görüş) ───\n"
+        "Müştəri eyni mesajda BİR NEÇƏ vaxt/xidmət istəyirsə (məs.\n"
+        '"bazar ertəsi saç + cümə axşamı boya"), HƏR görüş üçün AYRI\n'
+        "[BOOKING] tag-ı yaz. Sistem hər birini ayrıca qeyd edir.\n\n"
+        'Müştəri: "Bazar ertəsi 11-də saç, cümə 14-də boya etmək olar?"\n'
+        "Cavabın:\n"
+        "Əla! 🌸 Bazar ertəsi 11:00 — saç, cümə 14:00 — boya — hər ikisi açıqdır. Adınızı bilə bilərəm?\n"
+        '[BOOKING]{"service":"Saç","date":"2026-06-01","time":"11:00","price_azn":15,"status":"pending"}[/BOOKING]\n'
+        '[BOOKING]{"service":"Saç boyası","date":"2026-06-05","time":"14:00","price_azn":40,"status":"pending"}[/BOOKING]\n\n'
         "MÜHÜM: Tag istifadəçiyə görünməyəcək — sistem onu silir. Hər randevu söhbətində yaz.\n"
         "Tag-ın İÇİNDƏKİ JSON DƏYƏRLƏRİ HƏMİŞƏ Azərbaycan/orijinal şəkildə qalır (service adı kataloqdan, və s.) — yalnız MÜŞTƏRİYƏ GÖRÜNƏN MƏTN müştərinin dilində olur.\n\n"
         "════════ RANDEVU LƏĞVİ — [CANCEL] TAG ════════\n"
@@ -356,43 +390,62 @@ def _strip_markdown(text: str) -> str:
 
 def extract_booking(text: str) -> Tuple[str, Optional[dict]]:
     """
-    Pull a [BOOKING]{...}[/BOOKING] payload out of the AI reply.
-    Returns (cleaned_text, booking_dict_or_None).
+    Backwards-compatible wrapper — returns the FIRST [BOOKING] tag.
+    For multi-step bookings, callers should use extract_bookings().
+    """
+    cleaned, bookings = extract_bookings(text)
+    return cleaned, (bookings[0] if bookings else None)
+
+
+def extract_bookings(text: str) -> Tuple[str, list[dict]]:
+    """
+    Pull ALL [BOOKING]{...}[/BOOKING] payloads out of the AI reply.
+    Supports multi-step bookings ("haircut Monday + color Wednesday"
+    creates two distinct bookings in one chat turn).
+    Returns (cleaned_text, list_of_booking_dicts).
     """
     if not text:
-        return text, None
-    m = _BOOKING_RE.search(text)
-    if not m:
-        return text, None
-    raw = m.group(1)
+        return text, []
+    matches = list(_BOOKING_RE.finditer(text))
+    if not matches:
+        return text, []
     cleaned = _BOOKING_RE.sub("", text).strip()
-    try:
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            return cleaned, None
-        return cleaned, data
-    except Exception as e:
-        print(f"[ai] booking JSON parse failed: {e}; raw={raw!r}")
-        return cleaned, None
+    bookings: list[dict] = []
+    for m in matches:
+        raw = m.group(1)
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                bookings.append(data)
+        except Exception as e:
+            print(f"[ai] booking JSON parse failed: {e}; raw={raw!r}")
+    return cleaned, bookings
 
 
 def generate_reply(bot: dict, user_message: str, history: list[dict]) -> str:
     """
     Backwards-compatible wrapper — returns only the user-facing text.
     """
-    reply, _booking, _cancel = generate_reply_with_booking(bot, user_message, history)
+    reply, _booking, _cancel, _bookings = generate_reply_with_booking(bot, user_message, history)
     return reply
 
 
 def generate_reply_with_booking(
     bot: dict, user_message: str, history: list[dict]
-) -> Tuple[str, Optional[dict], bool]:
+) -> Tuple[str, Optional[dict], bool, list[dict]]:
     """
-    Generate an AI reply and extract any structured booking payload AND
+    Generate an AI reply and extract any structured booking payloads AND
     cancellation intent flag.
 
     history: list of {"role": "user"|"assistant", "content": str}
-    Returns: (user_facing_reply, booking_dict_or_None, wants_cancel)
+    Returns: (user_facing_reply, first_booking_or_None, wants_cancel,
+              all_bookings)
+
+    The 4th return value (all_bookings) is the full list — used by
+    callers that want to support multi-step bookings ("haircut Monday +
+    color Wednesday" in one message). Backwards-compat: callers that
+    unpack only 3 values still work by ignoring the trailing list, but
+    they'll only get the first booking saved.
     """
     system = build_system_prompt(bot)
 
@@ -415,14 +468,18 @@ def generate_reply_with_booking(
         text = ((resp.choices[0].message.content if resp.choices else "") or "").strip()
         if text:
             print(f"[ai] raw reply ({len(text)} chars, model={MODEL}): {text[:400]!r}")
-            cleaned, booking = extract_booking(text)
+            cleaned, bookings = extract_bookings(text)
             cleaned, wants_cancel = extract_cancel(cleaned)
             cleaned = _strip_markdown(cleaned)
-            if booking:
-                print(f"[ai] extracted booking: {booking}")
+            if bookings:
+                print(f"[ai] extracted {len(bookings)} booking(s): {bookings}")
             if wants_cancel:
                 print("[ai] extracted CANCEL intent from reply")
-            return cleaned, booking, wants_cancel
+            # Stash the full list for callers that want multi-step support.
+            # Existing callers reading the 3rd return value as a single
+            # dict get the first booking (backwards-compatible).
+            first = bookings[0] if bookings else None
+            return cleaned, first, wants_cancel, bookings
     except Exception as e:
         print(f"[ai] generation failed ({MODEL}): {e}")
 
@@ -430,7 +487,7 @@ def generate_reply_with_booking(
     # language from their message (basic char-class heuristic) and pick
     # the right apology — much friendlier than always replying in AZ when
     # the customer was writing in RU/EN.
-    return (_fallback_message(user_message), None, False)
+    return (_fallback_message(user_message), None, False, [])
 
 
 def _fallback_message(user_message: str) -> str:

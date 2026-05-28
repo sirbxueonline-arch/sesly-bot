@@ -183,6 +183,29 @@ def telegram_update_seen(update_id: int) -> bool:
         return False
 
 
+def get_bot_services_detail(bot_id: str) -> list[dict]:
+    """Structured services with optional service-specific working hours.
+    The AI uses this to refuse bookings for a service outside its hours
+    (e.g. "boya yalnız 14:00–20:00 arası") even when the bot-level
+    schedule is wider."""
+    if not bot_id:
+        return []
+    try:
+        r = (
+            client()
+            .table("bot_services")
+            .select("name, price_azn, duration_minutes, working_hours, status, sort_order")
+            .eq("bot_id", bot_id)
+            .neq("status", "archived")
+            .order("sort_order")
+            .execute()
+        )
+        return r.data or []
+    except Exception as e:
+        print(f"[db] get_bot_services_detail failed: {e}")
+        return []
+
+
 def get_bot_staff(bot_id: str) -> list[dict]:
     """Active staff members for a bot, ordered as the owner arranged them."""
     if not bot_id:
