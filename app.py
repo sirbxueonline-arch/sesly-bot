@@ -1336,7 +1336,7 @@ def _run_reminders():
             print(f"[reminder] failed for {b['id']}: {e}")
             skipped += 1
 
-    return {"window_min": "60-90", "sent": sent, "skipped": skipped}
+    return {"window_min": "60-120", "sent": sent, "skipped": skipped}
 
 
 def _run_auto_complete():
