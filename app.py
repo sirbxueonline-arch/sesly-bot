@@ -1482,18 +1482,37 @@ def _run_auto_complete():
             skipped += 1
             continue
 
-        # Send review request via the right channel
+        # Send review request via the right channel — in the customer's
+        # language (detected from their most-recent inbound message).
         cust_phone = b.get("customer_phone") or ""
         bot_row = b.get("bots") or {}
         biz_name = bot_row.get("display_name") or "Sesly"
-        cust_name = (b.get("customer_name") or "").strip() or "müştəri"
         service = (b.get("service") or "").strip()
-        msg = (
-            f"Salam {cust_name}! {biz_name}-da görüşünüz necə oldu? 💛\n\n"
-            f"1-dən 5-ə qədər ulduz verə bilərsiniz (sadəcə rəqəm yazın). "
-            f"Rəyiniz bizə daha yaxşı xidmət vermək üçün kömək edir."
-            + (f"\n\n(Xidmət: {service})" if service else "")
-        )
+        lang = db.detect_customer_language(b.get("bot_id") or "", cust_phone)
+        if lang == "ru":
+            cust_name = (b.get("customer_name") or "").strip() or "клиент"
+            msg = (
+                f"Здравствуйте, {cust_name}! Как прошло посещение {biz_name}? 💛\n\n"
+                f"Оцените от 1 до 5 звёзд (просто напишите цифру). "
+                f"Ваш отзыв помогает нам стать лучше."
+                + (f"\n\n(Услуга: {service})" if service else "")
+            )
+        elif lang == "en":
+            cust_name = (b.get("customer_name") or "").strip() or "there"
+            msg = (
+                f"Hi {cust_name}! How was your visit to {biz_name}? 💛\n\n"
+                f"Please rate us from 1 to 5 stars (just send a number). "
+                f"Your feedback helps us improve."
+                + (f"\n\n(Service: {service})" if service else "")
+            )
+        else:
+            cust_name = (b.get("customer_name") or "").strip() or "müştəri"
+            msg = (
+                f"Salam {cust_name}! {biz_name}-da görüşünüz necə oldu? 💛\n\n"
+                f"1-dən 5-ə qədər ulduz verə bilərsiniz (sadəcə rəqəm yazın). "
+                f"Rəyiniz bizə daha yaxşı xidmət vermək üçün kömək edir."
+                + (f"\n\n(Xidmət: {service})" if service else "")
+            )
 
         if tg.is_telegram_customer(cust_phone):
             try:

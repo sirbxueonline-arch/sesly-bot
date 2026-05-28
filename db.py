@@ -183,6 +183,61 @@ def telegram_update_seen(update_id: int) -> bool:
         return False
 
 
+def detect_customer_language(bot_id: str, customer_phone: str) -> str:
+    """Best-effort language detection from the customer's most recent
+    inbound message. Returns 'ru', 'en', or 'az' (default).
+
+    Used to localize system-initiated messages like review prompts and
+    reminders — the bot already mirrors language for live replies, but
+    cron-driven sends need to know the language without an active LLM
+    call."""
+    if not bot_id or not customer_phone:
+        return "az"
+    try:
+        conv = (
+            client()
+            .table("conversations")
+            .select("id")
+            .eq("bot_id", bot_id)
+            .eq("customer_phone", customer_phone)
+            .order("last_message_at", desc=True)
+            .limit(1)
+            .maybe_single()
+            .execute()
+        )
+        conv_id = (conv.data or {}).get("id") if conv else None
+        if not conv_id:
+            return "az"
+        # Look at the last 5 inbound (user) messages and pick the language
+        # from the most-recent non-empty one
+        msgs = (
+            client()
+            .table("messages")
+            .select("content, role")
+            .eq("conversation_id", conv_id)
+            .eq("role", "user")
+            .order("created_at", desc=True)
+            .limit(5)
+            .execute()
+        )
+        for m in (msgs.data or []):
+            text = (m.get("content") or "").strip()
+            if not text:
+                continue
+            # Cyrillic block → Russian
+            if any("Ѐ" <= ch <= "ӿ" for ch in text):
+                return "ru"
+            # Mostly ASCII letters, no AZ-specific chars → English
+            ascii_letters = sum(1 for ch in text if ch.isascii() and ch.isalpha())
+            az_chars = sum(1 for ch in text if ch in "əğıöşçüƏĞİÖŞÇÜ")
+            if ascii_letters > 5 and az_chars == 0:
+                return "en"
+            return "az"
+    except Exception as e:
+        print(f"[lang] detect failed: {e}")
+    return "az"
+
+
 def get_bot_services_detail(bot_id: str) -> list[dict]:
     """Structured services with optional service-specific working hours.
     The AI uses this to refuse bookings for a service outside its hours
@@ -872,9 +927,14 @@ def check_slot_conflict(
         normalized = scheduled_at.replace("Z", "+00:00") if "Z" in scheduled_at else scheduled_at
         start = datetime.fromisoformat(normalized)
         end = start + timedelta(minutes=duration_minutes or 60)
-        # Pull bookings on the same day, filter overlap in Python (small set)
-        day_start = start.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        day_end = (start.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).isoformat()
+        # Pull bookings in a 3-day window centered on the proposed slot —
+        # YESTERDAY, TODAY, TOMORROW. The wider window catches bookings
+        # that cross midnight: a 4-hour service starting at 23:30 ends at
+        # 03:30 the next day, and would otherwise miss conflicts on either
+        # side of the same-day window. Filter overlap precisely in Python.
+        day_anchor = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start = (day_anchor - timedelta(days=1)).isoformat()
+        day_end = (day_anchor + timedelta(days=2)).isoformat()
         q = (
             client()
             .table("bookings")
