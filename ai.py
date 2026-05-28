@@ -264,12 +264,35 @@ def build_system_prompt(bot: dict) -> str:
         "Müştəri: \"İş saatlarınız necədir?\" (vaxt yox, sadəcə məlumat soruşur)\n"
         "Cavabın: (BOOKING tag-ı YOX, sadəcə cavab)\n"
         "İş saatlarımız: B.ertəsi–Cümə 09:00-19:00.\n\n"
+        "─── Rus dilində eyni nümunə (eyni BOOKING tag-i, eyni format) ───\n"
+        'Müştəri (RU): "можно завтра в 14:00 на маникюр?"\n'
+        "Cavabın:\n"
+        "Здравствуйте! Завтра в 14:00 свободно 🌸 Подскажите ваше имя?\n"
+        '[BOOKING]{"service":"Manikür","date":"2026-05-27","time":"14:00","price_azn":12,"status":"pending"}[/BOOKING]\n\n'
+        "─── İngilis dilində eyni nümunə ───\n"
+        'Müştəri (EN): "can I book a manicure tomorrow at 2pm?"\n'
+        "Cavabın:\n"
+        "Hi! 2 PM tomorrow is free 🌸 Can I get your name?\n"
+        '[BOOKING]{"service":"Manikür","date":"2026-05-27","time":"14:00","price_azn":12,"status":"pending"}[/BOOKING]\n\n'
         "MÜHÜM: Tag istifadəçiyə görünməyəcək — sistem onu silir. Hər randevu söhbətində yaz.\n"
+        "Tag-ın İÇİNDƏKİ JSON DƏYƏRLƏRİ HƏMİŞƏ Azərbaycan/orijinal şəkildə qalır (service adı kataloqdan, və s.) — yalnız MÜŞTƏRİYƏ GÖRÜNƏN MƏTN müştərinin dilində olur.\n"
     )
 
     extra = (bot.get("system_prompt_addition") or "").strip()
     if extra:
         base += f"\n════════ ƏLAVƏ TƏLİMATLAR ════════\n{extra}\n"
+
+    # Closing reminder — LLMs weight the END of the prompt heavily. Repeat
+    # the single most important rule (language mirroring) so it's the last
+    # thing in working memory before the model starts generating.
+    base += (
+        "\n════════ SON XATIRLATMA ════════\n"
+        "Müştərinin SON mesajının dilinə bax. Cavabını HƏMİN DİLDƏ yaz:\n"
+        "  • Müştəri rusca yazıbsa → cavab rusca\n"
+        "  • Müştəri ingiliscə yazıbsa → cavab ingiliscə\n"
+        "  • Başqa hər şey → Azərbaycanca\n"
+        "Heç vaxt müştərini onun dilindən başqa bir dilə keçirməyə məcbur etmə.\n"
+    )
 
     return base
 
