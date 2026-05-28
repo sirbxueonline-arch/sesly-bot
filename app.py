@@ -1155,6 +1155,46 @@ def cron_admin_preview():
     except Exception as e:
         out["next_24h_error"] = f"{e}"
 
+    # Catch-all: show the 20 most recent bookings across ALL statuses /
+    # times — so we can see if the test booking exists at all, and if so,
+    # in what state.
+    try:
+        recent = (
+            db.client().table("bookings")
+            .select(
+                "id, customer_phone, customer_name, service, scheduled_at, "
+                "scheduled_time_text, status, reminder_sent_at, created_at, "
+                "bots(handle)"
+            )
+            .order("created_at", desc=True)
+            .limit(20)
+            .execute()
+        )
+        out["last_20_bookings_any_status"] = [
+            {
+                "id": b.get("id"),
+                "handle": (b.get("bots") or {}).get("handle"),
+                "status": b.get("status"),
+                "scheduled_at": b.get("scheduled_at"),
+                "scheduled_time_text": b.get("scheduled_time_text"),
+                "minutes_until": (
+                    int(
+                        (datetime.fromisoformat(
+                            (b["scheduled_at"] or "").replace("Z", "+00:00")
+                        ) - now_utc).total_seconds() / 60
+                    )
+                    if b.get("scheduled_at") else None
+                ),
+                "customer": b.get("customer_name") or b.get("customer_phone"),
+                "service": b.get("service"),
+                "reminder_sent_at": b.get("reminder_sent_at"),
+                "created_at": b.get("created_at"),
+            }
+            for b in (recent.data or [])
+        ]
+    except Exception as e:
+        out["recent_bookings_error"] = f"{e}"
+
     return jsonify(out)
 
 
