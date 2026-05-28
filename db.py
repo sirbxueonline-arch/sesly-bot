@@ -684,21 +684,54 @@ def save_booking(
 
 
 def detect_cancellation_intent(message: str) -> bool:
-    """Return True if the customer message looks like 'cancel my booking'."""
+    """Return True if the customer message looks like 'cancel my booking'.
+
+    Fast-path keyword check — covers obvious phrasings. The AI also has a
+    [CANCEL] tag it can emit for fuzzier cases, so even if this misses,
+    the post-processing layer catches it.
+    """
     if not message:
         return False
     text = message.strip().lower()
-    if len(text) > 80:
+    if len(text) > 120:
         return False
-    triggers = [
-        "ləğv et", "ləğv edirəm", "ləğv olun",
-        "ləğv etmək istəyirəm", "ləğv olunsun",
-        "iptal", "iptal et",       # TR-leaning but real users say this
-        "cancel", "cancel my appointment",
-        "imtina edirəm", "gəlməyəcəm", "gələ bilməyəcəm",
+
+    # Multi-word phrases (need substring match)
+    phrases = [
+        # AZ
+        "ləğv et", "ləğv edirəm", "ləğv olun", "ləğv olunsun",
+        "ləğv etmək", "ləğv edək", "ləğvini",
         "randevunu ləğv", "randevumu ləğv",
+        "imtina edirəm", "imtina edirik",
+        "gəlməyəcəm", "gələ bilməyəcəm", "gələ bilmirəm",
+        "gələ bilmərəm", "gələ bilmərik",
+        "iştirak edə bilmirəm", "iştirak edə bilməyəcəm",
+        "vaxtım yoxdur", "vaxtım olmayacaq", "vaxtım olmadı",
+        "imkanım olmayacaq", "imkanım yoxdur",
+        "alınmadı", "alınmır", "alınmayacaq",
+        # TR-leaning but real Azerbaijani customers say this
+        "iptal et", "iptal etmek", "iptal edirəm",
+        # RU
+        "не приду", "не смогу", "не получится", "не получаеться",
+        "отменить", "отменяю", "отмени", "отмена",
+        # EN
+        "cancel my", "cancel the", "cancel it", "cancel please",
+        "can't make it", "cant make it", "cannot make it",
+        "won't make it", "wont make it", "not coming",
+        "i'm not coming", "i am not coming",
     ]
-    return any(t in text for t in triggers)
+    if any(p in text for p in phrases):
+        return True
+
+    # Standalone single-word triggers (need word-boundary match, not substring,
+    # so we don't match "iptal" inside "kapitalist" etc.)
+    import re
+    standalone = ("iptal", "cancel", "отмена", "отмени", "ləğv")
+    for w in standalone:
+        if re.search(rf"\b{re.escape(w)}\b", text):
+            return True
+
+    return False
 
 
 def cancel_latest_booking(bot_id: str, customer_phone: str) -> Optional[dict]:

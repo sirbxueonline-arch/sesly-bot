@@ -221,10 +221,15 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
             history = db.get_recent_history(bot["id"], customer_phone)
             if history and history[-1].get("content") == extra:
                 history = history[:-1]
-            reply, booking = ai.generate_reply_with_booking(bot, extra, history)
+            reply, booking, wants_cancel = ai.generate_reply_with_booking(bot, extra, history)
             db.save_message(bot["id"], customer_phone, "assistant", reply)
             if booking:
                 db.save_booking(bot["id"], customer_phone, booking)
+            if wants_cancel:
+                try:
+                    db.cancel_latest_booking(bot["id"], customer_phone)
+                except Exception as e:
+                    print(f"[handler] AI-cancel failed: {e}")
             return reply, bot
 
         greeting = bot.get("greeting_message") or "Salam! 👋"
@@ -293,10 +298,21 @@ def _handle_message(customer_phone: str, message: str, message_type: str = "text
     history = db.get_recent_history(bot["id"], customer_phone)
     if history and history[-1].get("content") == message:
         history = history[:-1]
-    reply, booking = ai.generate_reply_with_booking(bot, message, history)
+    reply, booking, wants_cancel = ai.generate_reply_with_booking(bot, message, history)
     db.save_message(bot["id"], customer_phone, "assistant", reply)
     if booking:
         db.save_booking(bot["id"], customer_phone, booking)
+    # AI-detected cancellation (covers cases the keyword pre-check missed —
+    # e.g. "ola bilmir, başqa vaxt yazaram" or "не приду извините")
+    if wants_cancel:
+        try:
+            cancelled = db.cancel_latest_booking(bot["id"], customer_phone)
+            if cancelled:
+                print(f"[handler] AI-cancel succeeded for booking={cancelled.get('id')}")
+            else:
+                print("[handler] AI flagged cancel but no active booking found")
+        except Exception as e:
+            print(f"[handler] AI-cancel failed: {e}")
     return reply, bot
 
 
@@ -1568,8 +1584,8 @@ def preview():
         if role in ("user", "assistant") and content:
             clean_history.append({"role": role, "content": content})
 
-    reply, booking = ai.generate_reply_with_booking(bot, message, clean_history)
-    resp = jsonify({"reply": reply, "booking": booking})
+    reply, booking, wants_cancel = ai.generate_reply_with_booking(bot, message, clean_history)
+    resp = jsonify({"reply": reply, "booking": booking, "wants_cancel": wants_cancel})
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 

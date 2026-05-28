@@ -275,7 +275,22 @@ def build_system_prompt(bot: dict) -> str:
         "Hi! 2 PM tomorrow is free 🌸 Can I get your name?\n"
         '[BOOKING]{"service":"Manikür","date":"2026-05-27","time":"14:00","price_azn":12,"status":"pending"}[/BOOKING]\n\n'
         "MÜHÜM: Tag istifadəçiyə görünməyəcək — sistem onu silir. Hər randevu söhbətində yaz.\n"
-        "Tag-ın İÇİNDƏKİ JSON DƏYƏRLƏRİ HƏMİŞƏ Azərbaycan/orijinal şəkildə qalır (service adı kataloqdan, və s.) — yalnız MÜŞTƏRİYƏ GÖRÜNƏN MƏTN müştərinin dilində olur.\n"
+        "Tag-ın İÇİNDƏKİ JSON DƏYƏRLƏRİ HƏMİŞƏ Azərbaycan/orijinal şəkildə qalır (service adı kataloqdan, və s.) — yalnız MÜŞTƏRİYƏ GÖRÜNƏN MƏTN müştərinin dilində olur.\n\n"
+        "════════ RANDEVU LƏĞVİ — [CANCEL] TAG ════════\n"
+        "Müştəri AKTIV randevusunu LƏĞV ETMƏK istəyirsə (gəlməyəcək, ləğv edirəm,\n"
+        "iptal, cancel, отменить, не приду, can't make it və s.) — cavabının\n"
+        "SONUNA bu gizli tag-ı əlavə et:\n\n"
+        "[CANCEL][/CANCEL]\n\n"
+        "Sistem ən yeni 'pending' və ya 'confirmed' randevunu tapıb 'cancelled'\n"
+        "statusuna keçirəcək. Müştəriyə görünən mətndə təsdiq ver (öz dilində):\n"
+        "  • AZ: \"Anlaşıldı, randevunuz ləğv edildi 🗓 Başqa vaxta yazsanız, yer açaram.\"\n"
+        "  • RU: \"Хорошо, ваша запись отменена 🗓 Если решите перенести — напишите.\"\n"
+        "  • EN: \"Got it — your appointment is cancelled 🗓 Let me know if you'd like to reschedule.\"\n\n"
+        "DİQQƏT:\n"
+        "• Yalnız müştəri AÇIQ-AYDIN ləğv istəyirsə tag yaz.\n"
+        "• \"Başqa vaxta keçə bilərəm?\" → bu LƏĞV deyil, dəyişiklikdir (tag yazma, yeni vaxt soruş).\n"
+        "• \"Vaxtım azdır\" → bu hələ ləğv deyil, soruş.\n"
+        "• Müştəri yeni randevu yazırsa, [BOOKING] tag-ı yaz, [CANCEL] yox.\n"
     )
 
     extra = (bot.get("system_prompt_addition") or "").strip()
@@ -301,6 +316,19 @@ _BOOKING_RE = re.compile(
     r"\[BOOKING\]\s*(\{.*?\})\s*\[/BOOKING\]",
     re.DOTALL | re.IGNORECASE,
 )
+
+_CANCEL_RE = re.compile(r"\[CANCEL\]\s*\[/CANCEL\]", re.IGNORECASE)
+
+
+def extract_cancel(text: str) -> Tuple[str, bool]:
+    """Pull a [CANCEL][/CANCEL] marker out of the AI reply.
+    Returns (cleaned_text, found_cancel_intent)."""
+    if not text:
+        return text, False
+    if _CANCEL_RE.search(text):
+        cleaned = _CANCEL_RE.sub("", text).strip()
+        return cleaned, True
+    return text, False
 
 
 # WhatsApp doesn't render markdown consistently across clients (Web vs phone,
@@ -352,18 +380,19 @@ def generate_reply(bot: dict, user_message: str, history: list[dict]) -> str:
     """
     Backwards-compatible wrapper — returns only the user-facing text.
     """
-    reply, _booking = generate_reply_with_booking(bot, user_message, history)
+    reply, _booking, _cancel = generate_reply_with_booking(bot, user_message, history)
     return reply
 
 
 def generate_reply_with_booking(
     bot: dict, user_message: str, history: list[dict]
-) -> Tuple[str, Optional[dict]]:
+) -> Tuple[str, Optional[dict], bool]:
     """
-    Generate an AI reply and extract any structured booking payload.
+    Generate an AI reply and extract any structured booking payload AND
+    cancellation intent flag.
 
     history: list of {"role": "user"|"assistant", "content": str}
-    Returns: (user_facing_reply, booking_dict_or_None)
+    Returns: (user_facing_reply, booking_dict_or_None, wants_cancel)
     """
     system = build_system_prompt(bot)
 
@@ -387,16 +416,17 @@ def generate_reply_with_booking(
         if text:
             print(f"[ai] raw reply ({len(text)} chars, model={MODEL}): {text[:400]!r}")
             cleaned, booking = extract_booking(text)
+            cleaned, wants_cancel = extract_cancel(cleaned)
             cleaned = _strip_markdown(cleaned)
             if booking:
                 print(f"[ai] extracted booking: {booking}")
-            else:
-                print("[ai] no booking tag found in reply")
-            return cleaned, booking
+            if wants_cancel:
+                print("[ai] extracted CANCEL intent from reply")
+            return cleaned, booking, wants_cancel
     except Exception as e:
         print(f"[ai] generation failed ({MODEL}): {e}")
 
     return (
         "Üzr istəyirəm, hal-hazırda cavab verə bilmirəm. "
         "Bir az sonra yenidən cəhd edin."
-    ), None
+    ), None, False
